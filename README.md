@@ -1,183 +1,177 @@
-# 🛡️ dns-setup
+# dns-setup
 
-VPS DNS 自动配置工具 v2.0 — 集成 AKDNS 测速逻辑，自动扫描 8 个 AKDNS 节点，选出最快的 DNS，通过 unbound 本地转发器强制走 TCP，并防止 DHCP 续约覆盖配置。
+VPS 通用 DNS 配置工具，适用于 Alpine、Debian/Ubuntu 等 Linux VPS 和 Incus/LXC 容器。
 
-支持 Alpine Linux（openrc）和 Debian/Ubuntu（systemd）。
+脚本使用中文交互界面，自动下载 AKDNS 官方脚本读取当前节点列表，每个节点测试 2 次；UDP 不可用时自动改用 TCP。也支持手动输入任意 DNS 服务商地址，并通过 unbound 和 DHCP 防护避免 `/etc/resolv.conf` 被系统覆盖。
 
----
+## 功能
 
-## ✨ v2.0 新特性
+- 中文交互菜单和中文状态提示。
+- 自动下载：
+  `https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh`
+- 从 AKDNS 官方脚本动态读取 `DNS_LIST`，不在本项目中固定 AKDNS 节点。
+- 每个节点分别测试 UDP 和 TCP，每种协议测试 2 次并计算平均延迟。
+- UDP 有可用节点时优先使用最快 UDP。
+- 所有 UDP 节点不可用时，自动选择最快 TCP，并由 unbound 的 `forward-tcp-upstream: yes` 强制转发。
+- 手动输入任意 DNS 服务商的一个或多个 IPv4 地址。
+- 使用 unbound 监听 `127.0.0.1:53`，让系统解析链路稳定。
+- 自动备份当前 DNS 配置，支持还原。
+- 支持 Alpine/openrc 和 Debian/Ubuntu/systemd。
+- 处理 DHCP/网络管理器覆盖 DNS 的常见情况。
 
-- **集成 AKDNS 测速**：自动扫描 AKDNS 官方 8 个节点（与 akdns.sh 同源），UDP 和 TCP 同时测试
-- **智能协议选择**：UDP 优先，UDP 全超时时自动切换 TCP
-- **真实延迟测速**：每节点 ping 5 次取平均值，延迟单位精确到毫秒
-- **保留手动模式**：仍可手动输入任意 DNS 服务商
+## DHCP 覆盖保护
 
----
+Incus Alpine 容器常见链路：
 
-## 🧩 默认扫描的 AKDNS 节点
-
-| 地址 | 节点 |
-|------|------|
-| 66.66.66.66 | AKDNS #1 |
-| 45.207.157.146 | AKDNS #2 |
-| 108.160.138.51 | AKDNS #3 |
-| 139.180.133.239 | AKDNS #4 |
-| 45.76.83.113 | AKDNS #5 |
-| 45.76.71.83 | AKDNS #6 |
-| 45.63.99.176 | AKDNS #7 |
-| 166.0.199.207 | AKDNS #8 |
-
-> 注：节点列表与 [AKDNS 官方脚本](https://github.com/akile-network/aktools) 保持一致
-
----
-
-## ⚡ 快速开始
-
-一键安装并自动配置：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-setup.sh | sh -s -- --auto
+```text
+eth0 使用 DHCP
+  -> udhcpc 常驻后台
+  -> DHCP 续租或重新绑定
+  -> /usr/share/udhcpc/default.script
+  -> resolv_conf()
+  -> DHCP 下发的 DNS 覆盖 /etc/resolv.conf
 ```
 
-或分步执行：
+本脚本应用 DNS 后会：
 
-```bash
-# 下载脚本
-curl -fsSL https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-setup.sh -o /root/dns-setup.sh
+1. 把 `/etc/resolv.conf` 指向 `127.0.0.1`。
+2. 尝试对 `/etc/resolv.conf` 使用 `chattr +i`，阻止 DHCP 直接写入。
+3. 在 Alpine 的 `/usr/share/udhcpc/default.script` 中加入托管标记判断，续租时跳过 `resolv_conf()`。
+4. 如果检测到 `dhcpcd`，添加保护钩子。
+5. 在 systemd 系统中停用 `systemd-resolved`，避免它和静态配置冲突。
+6. unbound 注册为开机启动服务。
+
+如果容器文件系统不支持 immutable 属性，脚本仍会保留 DHCP 脚本保护；运行输出会明确提示实际启用的保护方式。
+
+## 快速开始
+
+下载并运行中文交互菜单：
+
+```sh
+wget -qO /root/dns-setup.sh https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-setup.sh
 chmod +x /root/dns-setup.sh
-
-# 交互式菜单
 sh /root/dns-setup.sh
-
-# 一键自动配置（非交互）
-sh /root/dns-setup.sh --auto
 ```
 
----
+也可以直接运行自动模式：
 
-## 🖥️ 菜单说明
-
-```
-╔══════════════════════════════════════╗
-  ║  DNS Setup  v2.0.0                   ║
-  ║System: alpine (openrc)               ║
-  ╠══════════════════════════════════════╣
-  ║  1) Auto-detect best DNS and apply   ║
-  ║  2) Manually enter DNS server(s)     ║
-  ║  3) Show current status              ║
-  ║  4) Restore original DNS             ║
-  ║  0) Exit                             ║
-  ╚══════════════════════════════════════╝
+```sh
+wget -qO- https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-setup.sh | sh -s -- --auto
 ```
 
-| 选项 | 功能 |
-|------|------|
-| 1 | **自动扫描 AKDNS**：测速 8 个节点（UDP+TCP），选最快的，配置 unbound 并锁定 |
-| 2 | **手动输入 DNS**：支持任意服务商（如 `8.8.8.8 1.1.1.1`），可选强制 TCP |
-| 3 | 显示当前 unbound 状态、上游、协议、DNS 解析结果 |
-| 4 | 还原到操作前的原始 DNS 配置 |
+自动模式会执行：
 
----
-
-## 🔧 命令行参数
-
-| 参数 | 说明 |
-|------|------|
-| `--auto` | 全自动扫描 AKDNS 并应用最佳节点，无需交互 |
-| `--status` | 查看当前状态 |
-| `--restore` | 还原原始 DNS |
-
----
-
-## 📊 测速示例输出
-
-```
-[INFO] Scanning DNS servers (5 pings each)...
-
-  Server                UDP (ms)        TCP (ms)      
-  --------------------  --------------  --------------
-  66.66.66.66           fail            fail          
-  45.207.157.146        fail            153 ms  ✓   
-  108.160.138.51        fail            109 ms  ✓   
-  139.180.133.239       fail            189 ms  ✓   
-  45.76.83.113          fail            150 ms  ✓   
-  45.76.71.83           fail            9 ms  ✓     
-  45.63.99.176          fail            138 ms  ✓   
-  166.0.199.207         fail            172 ms  ✓   
-
-[WARN] All UDP DNS timed out, trying TCP...
-[OK] TCP DNS available, will use TCP mode
-[INFO] Alpine/musl detected: forced TCP via unbound
-[OK] Best: 45.76.71.83  proto: tcp  latency: 9ms (TCP)
+```text
+下载 AKDNS 官方脚本
+  -> 读取 DNS_LIST
+  -> 每节点测试 UDP/TCP 各 2 次
+  -> UDP 可用则选择最快 UDP
+  -> UDP 全部不可用则选择最快 TCP
+  -> 写入 unbound
+  -> 设置 /etc/resolv.conf 为 127.0.0.1
+  -> 防止 DHCP 覆盖
+  -> 验证解析和 GitHub 访问
 ```
 
----
+## 菜单
 
-## 🏗️ 架构
+```text
+========================================
+       通用 DNS 配置工具 v2.1.0
+========================================
+系统：Alpine Linux（openrc）
 
+  1) 下载 AKDNS 官方脚本并自动测速配置
+  2) 手动输入 DNS 服务商地址
+  3) 查看当前 DNS 状态
+  4) 还原上一次备份的 DNS
+  0) 退出
 ```
-系统程序
-  └─▶ 127.0.0.1:53  (本地 unbound)
-        └─▶ 强制 TCP  ──▶  AKDNS 最快节点:53
+
+### 1. 自动测速配置
+
+从 AKDNS 官方脚本实时读取节点，不使用本项目内的固定节点列表。每个节点 UDP、TCP 各测试 2 次。
+
+- UDP 有可用节点：选最快 UDP。
+- UDP 全部失败、TCP 有可用节点：选最快 TCP。
+- Alpine/musl 环境使用 unbound 强制 TCP，不依赖 `options use-vc`。
+
+### 2. 手动配置
+
+输入一个或多个 DNS IPv4 地址，例如：
+
+```text
+8.8.8.8 8.8.4.4
+1.1.1.1 1.0.0.1
+45.76.71.83
 ```
 
-`/etc/resolv.conf` 始终保持 `nameserver 127.0.0.1`，由 unbound 负责转发和协议选择。
+随后选择是否强制上游使用 TCP。若服务器的 UDP/53 被封锁，应选择 `y`。
 
----
+### 3. 查看状态
 
-## 🛡️ DHCP 防护机制
+查看：
 
-解决 **Incus/LXC 容器 DHCP 续约覆盖 DNS** 的问题：
+- `/etc/resolv.conf`
+- unbound 服务状态
+- unbound 上游和协议
+- DHCP 托管标记
+- 文件 immutable 属性
+- 当前域名解析结果
 
-1. **`chattr +i`** — 文件系统锁定 `/etc/resolv.conf`
-2. **udhcpc patch** — 修改 Alpine 的 `/usr/share/udhcpc/default.script`，检测到托管标记后跳过 DNS 覆写
-3. **dhcpcd hook** — Debian/Ubuntu 的 dhcpcd 保护
-4. **systemd-resolved 禁用** — 停用可能冲突的系统 DNS 管理器
+### 4. 还原 DNS
 
----
+还原最近一次备份，并停止 unbound。备份目录：
 
-## 📂 文件说明
+```text
+/var/lib/dns-setup/backup/
+```
 
-| 路径 | 说明 |
-|------|------|
-| `/etc/unbound/unbound.conf` | unbound 主配置 |
-| `/etc/resolv.conf` | 系统 DNS，始终为 `127.0.0.1` |
-| `/etc/dns-setup-managed` | 托管标记，DHCP 保护依据此文件 |
-| `/var/lib/dns-setup/backup/` | 操作前的自动备份 |
-| `/usr/share/udhcpc/default.script.dns-setup-bak` | udhcpc 原始脚本备份 |
+## 命令行参数
 
----
+```sh
+sh dns-setup.sh --auto
+sh dns-setup.sh --status
+sh dns-setup.sh --restore
+```
 
-## ⚠️ 注意事项
+## 配置文件
 
-- 需要 root 权限运行
-- Alpine 使用 musl libc，`/etc/resolv.conf` 的 `options use-vc` 不可靠，本脚本通过 unbound 层解决
-- 部分 VPS 环境出站 UDP 53 被封锁，脚本会自动检测并切换到 TCP
-- 还原操作会停止 unbound 并解除所有保护
+```text
+/etc/unbound/unbound.conf
+/etc/resolv.conf
+/etc/dns-setup-managed
+/var/lib/dns-setup/backup/
+```
 
----
+## 解析链路
 
-## 🆚 与 AKDNS 官方脚本的区别
+UDP 正常时：
 
-| 特性 | dns-setup v2.0 | AKDNS 官方脚本 |
-|------|----------------|----------------|
-| 测速逻辑 | ✅ 完全集成 AKDNS 算法 | ✅ 原版 |
-| DNS 节点 | ✅ AKDNS 8 节点 | ✅ AKDNS 8 节点 |
-| TCP 强制 | ✅ unbound `forward-tcp-upstream` | ⚠️ `options use-vc`（Alpine 不可靠） |
-| DHCP 防护 | ✅ 三层保护 + udhcpc patch | ❌ 仅 `chattr +i` |
-| 手动 DNS | ✅ 支持任意服务商 | ❌ 仅 AKDNS |
-| 架构 | unbound 本地转发 | 直接写 `/etc/resolv.conf` |
+```text
+系统程序 -> 127.0.0.1:53 -> unbound -> 上游 DNS:53/UDP
+```
 
----
+UDP 不通时：
 
-## 📄 License
+```text
+系统程序 -> 127.0.0.1:53 -> unbound -> 上游 DNS:53/TCP
+```
+
+本地程序访问 `127.0.0.1` 时显示 UDP 是正常的；`forward-tcp-upstream: yes` 控制的是 unbound 到外部上游的连接协议。
+
+## 注意
+
+- 需要 root 权限。
+- 需要 VPS 能访问 GitHub raw；如果官方脚本无法下载，自动模式会停止，不会写入未知 DNS。
+- DNS 节点的可用性会随网络、运营商和时间变化，每次自动模式都会重新读取并测速。
+- 还原前会保留备份。
+- 生产环境请先创建 VPS/容器快照。
+
+## License
 
 MIT
 
----
+## 相关项目
 
-## 🔗 相关链接
-
-- AKDNS 官方：https://dns.akile.ai/
-- AKDNS 脚本仓库：https://github.com/akile-network/aktools
+- AKDNS：https://github.com/akile-network/aktools
