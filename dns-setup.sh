@@ -1,138 +1,184 @@
 #!/bin/sh
-# dns-setup.sh - Universal DNS forwarder with DHCP protection
-# Version: 2.0.0
-# Integrated AKDNS speed test logic
+# dns-setup.sh - 通用 DNS 配置工具
+# 版本：2.1.0
+# 自动从 AKDNS 官方脚本读取节点；每个节点测速 2 次
+# 支持 Alpine/openrc、Debian/Ubuntu/systemd，防止 DHCP 覆盖 resolv.conf
 
-VERSION="2.0.0"
+VERSION="2.1.0"
+AKDNS_URL="https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh"
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 BACKUP_DIR="/var/lib/dns-setup/backup"
 MANAGED_MARKER="/etc/dns-setup-managed"
 TEST_DOMAIN="www.google.com"
-COUNT=5
+COUNT=2
 TIMEOUT=1
+DNS_LIST=""
 
-# AKDNS node list
-DEFAULT_SERVERS="66.66.66.66 45.207.157.146 108.160.138.51 139.180.133.239 45.76.83.113 45.76.71.83 45.63.99.176 166.0.199.207"
+G='\033[0;32m'
+Y='\033[1;33m'
+R='\033[0;31m'
+C='\033[0;36m'
+N='\033[0m'
 
-G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; C='\033[0;36m'; N='\033[0m'
-ok(){ printf "${G}[OK]${N} %s\n" "$*"; }
-info() { printf "${C}[INFO]${N} %s\n" "$*"; }
-warn() { printf "${Y}[WARN]${N} %s\n" "$*"; }
-err()  { printf "${R}[ERR]${N}  %s\n" "$*"; }
-pause() { printf "\nPress Enter to continue..."; read _dummy; }
+ok() { printf "${G}[成功]${N} %s\n" "$*"; }
+info() { printf "${C}[信息]${N} %s\n" "$*"; }
+warn() { printf "${Y}[警告]${N} %s\n" "$*"; }
+err() { printf "${R}[错误]${N} %s\n" "$*"; }
+pause() { printf "\n按回车键返回菜单..."; read _dummy; }
 
 detect_system() {
     if [ -f /etc/alpine-release ]; then
-        OS=alpine; INIT=openrc
+        OS="Alpine Linux"
+        INIT="openrc"
     elif [ -f /etc/debian_version ]; then
-        OS=debian; INIT=systemd
+        OS="Debian/Ubuntu"
+        INIT="systemd"
     else
-        OS=other; INIT=unknown
+        OS="其他 Linux"
+        INIT="unknown"
     fi
 }
 
 ensure_deps() {
-    local need=0
+    need=0
     command -v unbound >/dev/null 2>&1 || need=1
     command -v dig >/dev/null 2>&1 || need=1
-    if [ $need -eq 1 ]; then
-        info "Installing unbound + dig..."
-        if [ "$OS" = "alpine" ]; then
-            apk add --no-cache unbound bind-tools 2>&1 | grep -E '(Installing|OK:|error)' || true
-        elif [ "$OS" = "debian" ]; then
-            apt-get install -y -qq unbound dnsutils 2>&1 | tail -3
-        fi
-    fi
-}
+    command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1 || need=1
 
-measure_dns_single() {
-    local dns="$1" extra="$2"
-    local sum=0 valid=0 i t
-    
-    for i in $(seq 1 $COUNT); do
-        t=$(dig @"$dns" "$TEST_DOMAIN" $extra +stats +time=$TIMEOUT +tries=1 2>/dev/null | awk '/Query time/{print $4}')
-        if [ -n "$t" ] && [ "$t" -gt 0 ] 2>/dev/null; then
-            sum=$((sum + t))
-            valid=$((valid + 1))
-        fi
-    done
-    
-    if [ $valid -eq 0 ]; then
-        echo "1000"
+    if [ "$need" -eq 0 ]; then
+        return 0
+    fi
+
+    info "正在安装 unbound、dig 和 wget..."
+    if [ "$OS" = "Alpine Linux" ]; then
+        apk add --no-cache unbound bind-tools wget
+    elif [ "$OS" = "Debian/Ubuntu" ]; then
+        apt-get update -qq
+        apt-get install -y unbound dnsutils wget
     else
-        echo $((sum / valid))
+        err "无法自动识别软件包管理器，请手动安装 unbound、dig、wget。"
+        return 1
     fi
 }
 
-auto_scan() {
+download_text() {
+    output="$1"
+    if command -v wget >/dev/null 2>&1; then
+        wget -qO "$output" "$AKDNS_URL"
+    else
+        curl -fsSL "$AKDNS_URL" -o "$output"
+    fi
+}
+
+load_akdns_nodes() {
+    akdns_file=$(mktemp /tmp/akdns.XXXXXX) || {
+        err "无法创建临时文件。"
+        return 1
+    }
+
+    info "正在下载 AKDNS 官方脚本并读取节点列表..."
+    if ! download_text "$akdns_file"; then
+        rm -f "$akdns_file"
+        err "无法下载 AKDNS 官方脚本：$AKDNS_URL"
+        return 1
+    fi
+
+    DNS_LIST=$(sed -n '/^DNS_LIST=(/,/^)/p' "$akdns_file" |
+        sed -n 's/.*"\([0-9][0-9.]*\)".*/\1/p' | tr '\n' ' ')
+    rm -f "$akdns_file"
+
+    if [ -z "$DNS_LIST" ]; then
+        err "没有从 AKDNS 官方脚本中读取到 DNS_LIST。"
+        return 1
+    fi
+
+    ok "已读取 AKDNS 节点：$DNS_LIST"
+}
+
+measure_dns() {
+    dns="$1"
+    extra="$2"
+    sum=0
+    valid=0
+    i=1
+
+    while [ "$i" -le "$COUNT" ]; do
+        query_time=$(dig @"$dns" "$TEST_DOMAIN" $extra \
+            +stats +time="$TIMEOUT" +tries=1 2>/dev/null |
+            awk '/Query time/ {print $4; exit}')
+        case "$query_time" in
+            ''|*[!0-9]*) ;;
+            *)
+                sum=$((sum + query_time))
+                valid=$((valid + 1))
+                ;;
+        esac
+        i=$((i + 1))
+    done
+
+    if [ "$valid" -eq 0 ]; then
+        printf '%s\n' 1000
+    else
+        printf '%s\n' $((sum / valid))
+    fi
+}
+
+scan_dns() {
     CHOSEN_SERVER=""
     CHOSEN_PROTO=""
-    local best_ms=99999 transport="UDP"
+    scan_file="/tmp/dns-scan.$$"
+    : > "$scan_file"
 
-    info "Scanning DNS servers ($COUNT pings each)..."
-    printf "\n  %-20s  %-14s  %-14s\n" "Server" "UDP (ms)" "TCP (ms)"
-    printf "  %-20s  %-14s  %-14s\n" "--------------------" "--------------" "--------------"
+    info "每个节点测试 ${COUNT} 次，测试域名：$TEST_DOMAIN"
+    printf "\n  %-20s %-14s %-14s\n" "DNS 地址" "UDP 平均延迟" "TCP 平均延迟"
+    printf "  %-20s %-14s %-14s\n" "--------------------" "--------------" "--------------"
 
-    local tmpfile="/tmp/dns-scan-$$.txt"
-    > "$tmpfile"
-    
-    local s u t u_label t_label
-    for s in $DEFAULT_SERVERS; do
-        u=$(measure_dns_single "$s" "")
-        t=$(measure_dns_single "$s" "+tcp")
-        
-        echo "$s $u $t" >> "$tmpfile"
-        
-        u_label="fail"
-        t_label="fail"
-        [ "$u" -lt 1000 ] 2>/dev/null && u_label="${u} ms✓"
-        [ "$t" -lt 1000 ] 2>/dev/null && t_label="${t} ms  ✓"
-        printf "  %-20s  %-14s  %-14s\n" "$s" "$u_label" "$t_label"
+    for dns in $DNS_LIST; do
+        udp_ms=$(measure_dns "$dns" "")
+        tcp_ms=$(measure_dns "$dns" "+tcp")
+        printf '%s %s %s\n' "$dns" "$udp_ms" "$tcp_ms" >> "$scan_file"
+
+        udp_text="不可用"
+        tcp_text="不可用"
+        [ "$udp_ms" -lt 1000 ] 2>/dev/null && udp_text="${udp_ms} ms"
+        [ "$tcp_ms" -lt 1000 ] 2>/dev/null && tcp_text="${tcp_ms} ms"
+        printf "  %-20s %-14s %-14s\n" "$dns" "$udp_text" "$tcp_text"
     done
-    printf "\n"
 
-    # Find best UDP
-    local best_udp best_udp_dns
-    best_udp=$(awk '$2 < 1000 {print $2, $1}' "$tmpfile" | sort -n | head -1 | awk '{print $1}')
-    best_udp_dns=$(awk '$2 < 1000 {print $2, $1}' "$tmpfile" | sort -n | head -1 | awk '{print $2}')
+    best_udp_line=$(awk '$2 < 1000 {print $2, $1}' "$scan_file" |
+        sort -n | head -1)
+    best_tcp_line=$(awk '$3 < 1000 {print $3, $1}' "$scan_file" |
+        sort -n | head -1)
 
-    if [ -n "$best_udp" ] && [ "$best_udp" -lt 1000 ] 2>/dev/null; then
-        CHOSEN_SERVER="$best_udp_dns"
-        CHOSEN_PROTO=udp
-        best_ms=$best_udp
-        transport="UDP"
+    if [ -n "$best_udp_line" ]; then
+        best_ms=$(echo "$best_udp_line" | awk '{print $1}')
+        CHOSEN_SERVER=$(echo "$best_udp_line" | awk '{print $2}')
+        CHOSEN_PROTO="udp"
+        ok "检测到可用 UDP，选择最快节点：$CHOSEN_SERVER（${best_ms} ms）"
+    elif [ -n "$best_tcp_line" ]; then
+        best_ms=$(echo "$best_tcp_line" | awk '{print $1}')
+        CHOSEN_SERVER=$(echo "$best_tcp_line" | awk '{print $2}')
+        CHOSEN_PROTO="tcp"
+        warn "所有 UDP DNS 均不可用，切换为 TCP。"
+        ok "选择最快 TCP 节点：$CHOSEN_SERVER（${best_ms} ms）"
+        [ "$OS" = "Alpine Linux" ] &&
+            info "Alpine 使用 musl，将由 unbound 强制转发 TCP。"
     else
-        warn "All UDP DNS timed out, trying TCP..."
-        local best_tcp best_tcp_dns
-        best_tcp=$(awk '$3 < 1000 {print $3, $1}' "$tmpfile" | sort -n | head -1 | awk '{print $1}')
-        best_tcp_dns=$(awk '$3 < 1000 {print $3, $1}' "$tmpfile" | sort -n | head -1 | awk '{print $2}')
-        
-        if [ -n "$best_tcp" ] && [ "$best_tcp" -lt 1000 ] 2>/dev/null; then
-            CHOSEN_SERVER="$best_tcp_dns"
-            CHOSEN_PROTO=tcp
-            best_ms=$best_tcp
-            transport="TCP"
-            ok "TCP DNS available, will use TCP mode"
-            if [ "$OS" = "alpine" ]; then
-                info "Alpine/musl detected: forced TCP via unbound"
-            fi
-        else
-            rm -f "$tmpfile"
-            err "Both UDP and TCP timed out, no usable DNS"
-            return 1
-        fi
+        rm -f "$scan_file"
+        err "UDP 和 TCP 都没有可用 DNS 节点。"
+        return 1
     fi
-    
-    rm -f "$tmpfile"
-    ok "Best: $CHOSEN_SERVER  proto: $CHOSEN_PROTO  latency: ${best_ms}ms ($transport)"
+
+    rm -f "$scan_file"
 }
 
 write_unbound_conf() {
-    local servers="$1" proto="$2"
-    mkdir -p /etc/unbound
+    servers="$1"
+    proto="$2"
+    mkdir -p /etc/unbound || return 1
 
     {
-        cat <<'CONF_HEAD'
+        cat <<'CONF'
 server:
     interface: 127.0.0.1
     port: 53
@@ -147,32 +193,33 @@ server:
 
 forward-zone:
     name: "."
-CONF_HEAD
-
+CONF
         if [ "$proto" = "tcp" ]; then
-            printf "    forward-tcp-upstream: yes\n"
+            printf '    forward-tcp-upstream: yes\n'
         fi
-
-        for s in $servers; do
-            printf "    forward-addr: %s@53\n" "$s"
+        for dns in $servers; do
+            printf '    forward-addr: %s@53\n' "$dns"
         done
     } > "$UNBOUND_CONF"
 
     if ! unbound-checkconf "$UNBOUND_CONF" >/dev/null 2>&1; then
-        err "unbound config validation failed:"
+        err "unbound 配置检查失败："
         unbound-checkconf "$UNBOUND_CONF"
         return 1
     fi
-    ok "unbound.conf written  servers: $servers  proto: $proto"
+    ok "unbound 配置已生成，协议：$proto，上游：$servers"
 }
 
 restart_unbound() {
     if [ "$INIT" = "openrc" ]; then
-        rc-service unbound restart 2>&1 | grep -E 'ok|!!' || true
+        rc-service unbound restart || rc-service unbound start
         rc-update add unbound default >/dev/null 2>&1 || true
     elif [ "$INIT" = "systemd" ]; then
+        systemctl enable --now unbound
         systemctl restart unbound
-        systemctl enable unbound >/dev/null 2>&1 || true
+    else
+        err "无法识别 init 系统，不能自动启动 unbound。"
+        return 1
     fi
 }
 
@@ -180,238 +227,233 @@ write_resolv() {
     chattr -i /etc/resolv.conf 2>/dev/null || true
     printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
     touch "$MANAGED_MARKER"
-    ok "resolv.conf -> nameserver 127.0.0.1"
+    ok "系统 DNS 已指向本机 unbound：127.0.0.1"
 }
 
 protect_dhcp() {
-    local changed=0
+    changed=0
 
     if chattr +i /etc/resolv.conf 2>/dev/null; then
-        ok "chattr +i applied (immutable lock)"
+        ok "已锁定 /etc/resolv.conf，防止 DHCP 覆盖。"
         changed=1
     else
-        warn "chattr unavailable; falling back to script-level protection"
+        warn "当前容器不支持 chattr +i，将使用 DHCP 脚本保护。"
     fi
 
-    local udhcpc_script="/usr/share/udhcpc/default.script"
+    udhcpc_script="/usr/share/udhcpc/default.script"
     if [ -f "$udhcpc_script" ]; then
         if ! grep -q 'DNS-SETUP-MANAGED' "$udhcpc_script"; then
             cp -p "$udhcpc_script" "${udhcpc_script}.dns-setup-bak"
-            local tmp="${udhcpc_script}.tmp.$$"
-            local in_func=0
+            tmp="${udhcpc_script}.tmp.$$"
+            in_func=0
             while IFS= read -r line; do
                 printf '%s\n' "$line"
                 if echo "$line" | grep -q '^resolv_conf()'; then
                     in_func=1
                 fi
-                if [ $in_func -eq 1 ] && echo "$line" | grep -q '^{'; then
-                    printf '\t# DNS-SETUP-MANAGED: skip DHCP DNS overwrite\n'
+                if [ "$in_func" -eq 1 ] && echo "$line" | grep -q '{'; then
+                    printf '\t# DNS-SETUP-MANAGED: 跳过 DHCP DNS 覆盖\n'
                     printf '\t[ -f "%s" ] && return 0\n' "$MANAGED_MARKER"
                     in_func=0
                 fi
             done < "$udhcpc_script" > "$tmp"
             mv "$tmp" "$udhcpc_script"
             chmod +x "$udhcpc_script"
-            ok "udhcpc default.script patched - DHCP DNS overwrite blocked"
+            ok "已保护 udhcpc default.script，续租时不会覆写 DNS。"
             changed=1
         else
-            ok "udhcpc script already patched"
+            ok "udhcpc default.script 已经受到保护。"
             changed=1
         fi
     fi
 
     if command -v dhcpcd >/dev/null 2>&1; then
-        local hook_dir="/etc/dhcpcd.enter-hooks.d"
+        hook_dir="/etc/dhcpcd.enter-hooks.d"
         mkdir -p "$hook_dir"
         cat > "$hook_dir/50-dns-setup-protect" <<HOOK
 # DNS-SETUP-MANAGED
 [ -f "$MANAGED_MARKER" ] && make_resolv_conf() { :; }
 HOOK
-        ok "dhcpcd hook installed"
+        ok "已添加 dhcpcd DNS 保护钩子。"
         changed=1
     fi
 
-    if [ "$INIT" = "systemd" ] && systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        systemctl stop systemd-resolved 2>/dev/null || true
-        systemctl disable systemd-resolved 2>/dev/null || true
-        ok "systemd-resolved disabled"
+    if [ "$INIT" = "systemd" ] &&
+        systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+        ok "已停用 systemd-resolved，避免它覆盖 DNS。"
         changed=1
     fi
 
-    [ $changed -eq 0 ] && warn "No DHCP protection applied (no known client found)"
-}
-
-verify() {
-    info "Verifying DNS resolution..."
-    sleep 1
-    local ip
-    ip=$(getent hosts "$TEST_DOMAIN" 2>/dev/null | awk '{print $1}' | head -1)
-    if [ -n "$ip" ]; then
-        ok "getent hosts $TEST_DOMAIN -> $ip"
-    else
-        err "System resolver failed for $TEST_DOMAIN"
-        dig @127.0.0.1 "$TEST_DOMAIN" +time=5 +tries=1 2>&1 | tail -8
-        return 1
-    fi
-    local http
-    http=$(curl -4 -sL --connect-timeout 8 -o /dev/null -w '%{http_code}' \
-        https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh 2>/dev/null)
-    if [ "$http" = "200" ]; then
-        ok "GitHub raw: HTTP 200"
-    else
-        warn "GitHub raw: HTTP $http"
-    fi
+    [ "$changed" -eq 0 ] &&
+        warn "没有发现可修改的 DHCP/DNS 管理器，仅完成 resolv.conf 写入。"
 }
 
 backup_current() {
-    mkdir -p "$BACKUP_DIR"
-    local ts
-    ts=$(date +%Y%m%d-%H%M%S)
+    mkdir -p "$BACKUP_DIR" || return 1
+    timestamp=$(date +%Y%m%d-%H%M%S)
     chattr -i /etc/resolv.conf 2>/dev/null || true
-    cp /etc/resolv.conf "${BACKUP_DIR}/resolv.conf.${ts}" 2>/dev/null || true
-    [ -f "$UNBOUND_CONF" ] && cp "$UNBOUND_CONF" "${BACKUP_DIR}/unbound.conf.${ts}" 2>/dev/null || true
-    ok "Backup saved to $BACKUP_DIR (*.$ts)"
+    cp -p /etc/resolv.conf "$BACKUP_DIR/resolv.conf.$timestamp" 2>/dev/null || true
+    [ -f "$UNBOUND_CONF" ] &&
+        cp -p "$UNBOUND_CONF" "$BACKUP_DIR/unbound.conf.$timestamp"
+    ok "当前配置已备份到：$BACKUP_DIR"
 }
 
-restore_dns() {
-    local latest
-    latest=$(ls -t "${BACKUP_DIR}/resolv.conf."* 2>/dev/null | head -1)
-    if [ -z "$latest" ]; then
-        err "No backup found in $BACKUP_DIR"
-        pause
+verify_dns() {
+    info "正在验证系统 DNS..."
+    sleep 1
+    ip=$(getent hosts "$TEST_DOMAIN" 2>/dev/null | awk 'NR==1 {print $1}')
+    if [ -n "$ip" ]; then
+        ok "$TEST_DOMAIN 解析成功：$ip"
+    else
+        err "系统 DNS 解析失败。"
+        dig @127.0.0.1 "$TEST_DOMAIN" +time=5 +tries=1 2>&1 | tail -8
         return 1
     fi
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    cp "$latest" /etc/resolv.conf
-    rm -f "$MANAGED_MARKER"
-    if [ "$INIT" = "openrc" ]; then
-        rc-service unbound stop 2>/dev/null || true
-        rc-update del unbound default 2>/dev/null || true
-    elif [ "$INIT" = "systemd" ]; then
-        systemctl stop unbound 2>/dev/null || true
-        systemctl disable unbound 2>/dev/null || true
+
+    if command -v curl >/dev/null 2>&1; then
+        http=$(curl -4 -sL --connect-timeout 8 -o /dev/null \
+            -w '%{http_code}' \
+            https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh 2>/dev/null)
+        [ "$http" = "200" ] &&
+            ok "GitHub raw 访问成功：HTTP $http" ||
+            warn "GitHub raw 返回：HTTP $http"
     fi
-    ok "Restored from $latest"
-    cat /etc/resolv.conf
-    pause
 }
 
-show_status() {
-    local svc_status attr proto upstream
-    if [ "$INIT" = "openrc" ]; then
-        svc_status=$(rc-service unbound status 2>/dev/null | grep -oE 'started|stopped' || echo unknown)
-    else
-        svc_status=$(systemctl is-active unbound 2>/dev/null || echo unknown)
-    fi
-    attr=$(lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}')
-    upstream=$(grep 'forward-addr' "$UNBOUND_CONF" 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
-    proto="UDP (default)"
-    grep -q 'forward-tcp-upstream: yes' "$UNBOUND_CONF" 2>/dev/null && proto="TCP forced"
-
-    local ip
-    ip=$(getent hosts "$TEST_DOMAIN" 2>/dev/null | awk '{print $1}' | head -1)
-
-    printf "\n  ╔════════════════════════════════════╗\n"
-    printf   "  ║  DNS Setup Status v%-5s          ║\n" "$VERSION"
-    printf   "  ╠════════════════════════════════════╣\n"
-    printf   "  ║  OS: %-22s  ║\n" "$OS ($INIT)"
-    printf   "  ║  resolv    : %-22s  ║\n" "$(cat /etc/resolv.conf 2>/dev/null | tr '\n' ' ')"
-    printf   "  ║  immutable : %-22s  ║\n" "$attr"
-    printf   "  ║  managed   : %-22s  ║\n" "$([ -f "$MANAGED_MARKER" ] && echo yes || echo no)"
-    printf   "  ║  unbound   : %-22s  ║\n" "$svc_status"
-    printf   "  ║  protocol  : %-22s  ║\n" "$proto"
-    printf   "  ║  upstream  : %-22s  ║\n" "${upstream:-(none)}"
-    printf   "  ║  $TEST_DOMAIN : %-22s  ║\n" "${ip:-(resolve failed)}"
-    printf   "  ╚════════════════════════════════════╝\n\n"
-    pause
+apply_dns() {
+    servers="$1"
+    proto="$2"
+    backup_current || return 1
+    write_unbound_conf "$servers" "$proto" || return 1
+    restart_unbound || return 1
+    write_resolv || return 1
+    protect_dhcp
+    verify_dns
 }
 
 auto_configure() {
-    ensure_deps
-    auto_scan || { pause; return 1; }
+    ensure_deps || return 1
+    load_akdns_nodes || return 1
+    scan_dns || return 1
 
-    printf "\n  Apply: %s via %s? [Y/n]: " "$CHOSEN_SERVER" "$CHOSEN_PROTO"
+    printf "\n将使用 %s（%s）作为上游，确认应用？[Y/n] " \
+        "$CHOSEN_SERVER" "$CHOSEN_PROTO"
     read confirm
     case "$confirm" in
-        n|N) info "Cancelled."; pause; return;;
+        n|N) info "已取消。"; return 0 ;;
     esac
 
-    backup_current
-    write_unbound_conf "$CHOSEN_SERVER" "$CHOSEN_PROTO" || { pause; return 1; }
-    restart_unbound
-    write_resolv
-    protect_dhcp
-    verify
-    printf "\n"
-    ok "Done. Upstream: $CHOSEN_SERVER ($CHOSEN_PROTO) via unbound @ 127.0.0.1"
-    pause
+    apply_dns "$CHOSEN_SERVER" "$CHOSEN_PROTO"
 }
 
 manual_configure() {
-    printf "\n  Enter DNS server IPs (space-separated):\n"
-    printf "  e.g. 8.8.8.8 1.1.1.1 45.76.71.83\n  > "
-    read user_servers
-    if [ -z "$user_servers" ]; then
-        warn "Cancelled."
-        pause
-        return
+    printf "\n请输入 DNS 地址（可输入多个，以空格分隔）：\n> "
+    read manual_servers
+    [ -n "$manual_servers" ] || {
+        warn "未输入 DNS，已取消。"
+        return 0
+    }
+
+    printf "是否强制上游使用 TCP？[y/N] "
+    read force_tcp
+    manual_proto="udp"
+    case "$force_tcp" in
+        y|Y) manual_proto="tcp" ;;
+    esac
+
+    ensure_deps || return 1
+    apply_dns "$manual_servers" "$manual_proto"
+}
+
+show_status() {
+    printf "\n========== DNS 当前状态 ==========\n"
+    printf "系统：%s（%s）\n" "$OS" "$INIT"
+    printf "resolv.conf：\n"
+    cat /etc/resolv.conf 2>/dev/null
+    printf "\nunbound："
+    if [ "$INIT" = "openrc" ]; then
+        rc-service unbound status 2>/dev/null | tail -1
+    else
+        systemctl is-active unbound 2>/dev/null || true
+    fi
+    printf "上游配置：\n"
+    grep 'forward-' "$UNBOUND_CONF" 2>/dev/null || true
+    printf "DHCP 托管标记："
+    [ -f "$MANAGED_MARKER" ] && echo "已启用" || echo "未启用"
+    printf "resolv.conf 属性："
+    lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}'
+    verify_dns
+}
+
+restore_dns() {
+    latest=$(ls -t "$BACKUP_DIR"/resolv.conf.* 2>/dev/null | head -1)
+    if [ -z "$latest" ]; then
+        err "没有找到可还原的 DNS 备份。"
+        return 1
     fi
 
-    printf "\n  Force TCP upstream? [y/N]: "
-    read ft
-    local proto=udp
-    case "$ft" in y|Y) proto=tcp ;; esac
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    cp "$latest" /etc/resolv.conf || return 1
+    rm -f "$MANAGED_MARKER"
 
-    ensure_deps
-    backup_current
-    write_unbound_conf "$user_servers" "$proto" || { pause; return 1; }
-    restart_unbound
-    write_resolv
-    protect_dhcp
-    verify
-    ok "Done."
-    pause
+    if [ "$INIT" = "openrc" ]; then
+        rc-service unbound stop >/dev/null 2>&1 || true
+        rc-update del unbound default >/dev/null 2>&1 || true
+    elif [ "$INIT" = "systemd" ]; then
+        systemctl disable --now unbound >/dev/null 2>&1 || true
+    fi
+    ok "已还原 DNS：$latest"
+    cat /etc/resolv.conf
+}
+
+menu() {
+    while true; do
+        printf "\033c"
+        printf "========================================\n"
+        printf "       通用 DNS 配置工具 v%s\n" "$VERSION"
+        printf "========================================\n"
+        printf "系统：%s（%s）\n\n" "$OS" "$INIT"
+        printf "  1) 下载 AKDNS 官方脚本并自动测速配置\n"
+        printf "  2) 手动输入 DNS 服务商地址\n"
+        printf "  3) 查看当前 DNS 状态\n"
+        printf "  4) 还原上一次备份的 DNS\n"
+        printf "  0) 退出\n\n"
+        printf "请选择 [0-4]："
+        read choice
+        case "$choice" in
+            1) auto_configure; pause ;;
+            2) manual_configure; pause ;;
+            3) show_status; pause ;;
+            4) restore_dns; pause ;;
+            0) printf "已退出。\n"; return 0 ;;
+            *) warn "无效选择，请输入 0-4。"; sleep 1 ;;
+        esac
+    done
 }
 
 detect_system
-
-case "$1" in
+case "${1:-}" in
     --auto)
-        ensure_deps
-        auto_scan || exit 1
-        backup_current
-        write_unbound_conf "$CHOSEN_SERVER" "$CHOSEN_PROTO" || exit 1
-        restart_unbound
-        write_resolv
-        protect_dhcp
-        verify
-        ok "Done. Upstream: $CHOSEN_SERVER ($CHOSEN_PROTO) via unbound @ 127.0.0.1"
-        exit 0
+        ensure_deps &&
+        load_akdns_nodes &&
+        scan_dns &&
+        apply_dns "$CHOSEN_SERVER" "$CHOSEN_PROTO"
+        exit $?
         ;;
-    --status)  show_status; exit ;;
-    --restore) restore_dns; exit ;;
+    --status)
+        show_status
+        exit $?
+        ;;
+    --restore)
+        restore_dns
+        exit $?
+        ;;
+    "")
+        menu
+        ;;
+    *)
+        printf "用法：%s [--auto|--status|--restore]\n" "$0"
+        exit 2
+        ;;
 esac
-
-while true; do
-    clear
-    printf "\n  ╔══════════════════════════════════════╗\n"
-    printf   "  ║  DNS Setup  v%-5s                   ║\n" "$VERSION"
-    printf   "  ║System: %-28s  ║\n" "$OS ($INIT)"
-    printf   "  ╠══════════════════════════════════════╣\n"
-    printf   "  ║  1) Auto-detect best DNS and apply   ║\n"
-    printf   "  ║  2) Manually enter DNS server(s)     ║\n"
-    printf   "  ║  3) Show current status              ║\n"
-    printf   "  ║  4) Restore original DNS             ║\n"
-    printf   "  ║  0) Exit                             ║\n"
-    printf   "  ╚══════════════════════════════════════╝\n\n"
-    printf   "  Choose [0-4]: "
-    read choice
-    case "$choice" in
-        1) auto_configure ;;
-        2) manual_configure ;;
-        3) show_status ;;
-        4) restore_dns ;;
-        0) exit 0 ;;
-        *) warn "Invalid choice"; sleep 1 ;;
-    esac
-done
