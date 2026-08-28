@@ -210,6 +210,15 @@ server:
     hide-identity: yes
     hide-version: yes
     prefetch: yes
+    cache-min-ttl: 3600
+    cache-max-ttl: 86400
+    msg-cache-size: 16m
+    msg-cache-slabs: 8
+    rrset-cache-size: 32m
+    rrset-cache-slabs: 8
+    outgoing-num-tcp: 8
+    infra-cache-min-rtt: 50
+    infra-cache-max-rtt: 1000
 
 forward-zone:
     name: "."
