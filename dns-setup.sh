@@ -1,10 +1,11 @@
 #!/bin/sh
 # dns-setup.sh - 通用 DNS 配置工具
-# 版本：2.1.0
-# 自动从 AKDNS 官方脚本读取节点；每个节点测速 2 次
+# 版本：2.2.0
+# 自动从 AKDNS 官方脚本读取节点；每个节点测速 2 次（节点间并发）
 # 支持 Alpine/openrc、Debian/Ubuntu/systemd，防止 DHCP 覆盖 resolv.conf
+# v2.2.0 新增：验证失败自动回滚、手动输入 IPv4 校验、并发测速、unbound.conf 一并还原
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 AKDNS_URL="https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh"
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 BACKUP_DIR="/var/lib/dns-setup/backup"
@@ -95,6 +96,14 @@ load_akdns_nodes() {
     ok "已读取 AKDNS 节点：$DNS_LIST"
 }
 
+valid_ip() {
+    # 校验 IPv4：4 段数字，每段 0-255
+    printf '%s\n' "$1" | awk -F. '
+        NF==4 { ok=1; for(i=1;i<=4;i++){ if($i !~ /^[0-9]+$/ || $i+0 < 0 || $i+0 > 255) ok=0 } }
+        END { exit (ok==1) ? 0 : 1 }
+    '
+}
+
 measure_dns() {
     dns="$1"
     extra="$2"
@@ -129,15 +138,26 @@ scan_dns() {
     scan_file="/tmp/dns-scan.$$"
     : > "$scan_file"
 
-    info "每个节点测试 ${COUNT} 次，测试域名：$TEST_DOMAIN"
+    info "并发测试所有节点（每个节点 UDP/TCP 各 ${COUNT} 次），测试域名：$TEST_DOMAIN"
     printf "\n  %-20s %-14s %-14s\n" "DNS 地址" "UDP 平均延迟" "TCP 平均延迟"
     printf "  %-20s %-14s %-14s\n" "--------------------" "--------------" "--------------"
 
+    # 节点间并发测速；单节点内部 UDP 与 TCP 各 COUNT 次串行
     for dns in $DNS_LIST; do
-        udp_ms=$(measure_dns "$dns" "")
-        tcp_ms=$(measure_dns "$dns" "+tcp")
-        printf '%s %s %s\n' "$dns" "$udp_ms" "$tcp_ms" >> "$scan_file"
+        (
+            udp_ms=$(measure_dns "$dns" "")
+            tcp_ms=$(measure_dns "$dns" "+tcp")
+            printf '%s %s %s\n' "$dns" "$udp_ms" "$tcp_ms" >> "$scan_file"
+        ) &
+    done
+    wait
 
+    for dns in $DNS_LIST; do
+        line=$(awk -v d="$dns" '$1==d {print; exit}' "$scan_file")
+        [ -z "$line" ] && continue
+        set -- $line
+        udp_ms=$2
+        tcp_ms=$3
         udp_text="不可用"
         tcp_text="不可用"
         [ "$udp_ms" -lt 1000 ] 2>/dev/null && udp_text="${udp_ms} ms"
@@ -293,23 +313,37 @@ backup_current() {
     mkdir -p "$BACKUP_DIR" || return 1
     timestamp=$(date +%Y%m%d-%H%M%S)
     chattr -i /etc/resolv.conf 2>/dev/null || true
-    cp -p /etc/resolv.conf "$BACKUP_DIR/resolv.conf.$timestamp" 2>/dev/null || true
+    if cp -p /etc/resolv.conf "$BACKUP_DIR/resolv.conf.$timestamp" 2>/dev/null; then
+        ok "当前配置已备份到：$BACKUP_DIR"
+    else
+        warn "无法备份当前 /etc/resolv.conf（继续执行）。"
+    fi
     [ -f "$UNBOUND_CONF" ] &&
-        cp -p "$UNBOUND_CONF" "$BACKUP_DIR/unbound.conf.$timestamp"
-    ok "当前配置已备份到：$BACKUP_DIR"
+        cp -p "$UNBOUND_CONF" "$BACKUP_DIR/unbound.conf.$timestamp" 2>/dev/null || true
+}
+
+wait_dns_ready() {
+    # 等待 unbound 准备好并能解析，最多 10 秒
+    i=0
+    while [ "$i" -lt 10 ]; do
+        if dig @127.0.0.1 "$TEST_DOMAIN" +time=2 +tries=1 +short 2>/dev/null | grep -qE '[0-9]'; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+    return 1
 }
 
 verify_dns() {
     info "正在验证系统 DNS..."
-    sleep 1
-    ip=$(getent hosts "$TEST_DOMAIN" 2>/dev/null | awk 'NR==1 {print $1}')
-    if [ -n "$ip" ]; then
-        ok "$TEST_DOMAIN 解析成功：$ip"
-    else
+    if ! wait_dns_ready; then
         err "系统 DNS 解析失败。"
         dig @127.0.0.1 "$TEST_DOMAIN" +time=5 +tries=1 2>&1 | tail -8
         return 1
     fi
+    ip=$(getent hosts "$TEST_DOMAIN" 2>/dev/null | awk 'NR==1 {print $1}')
+    ok "$TEST_DOMAIN 解析成功：$ip"
 
     if command -v curl >/dev/null 2>&1; then
         http=$(curl -4 -sL --connect-timeout 8 -o /dev/null \
@@ -326,10 +360,22 @@ apply_dns() {
     proto="$2"
     backup_current || return 1
     write_unbound_conf "$servers" "$proto" || return 1
-    restart_unbound || return 1
-    write_resolv || return 1
+    if ! restart_unbound; then
+        err "unbound 启动失败，正在还原最近备份..."
+        restore_dns >/dev/null 2>&1
+        return 1
+    fi
+    write_resolv || {
+        warn "写入 resolv.conf 失败，自动还原最近备份..."
+        restore_dns >/dev/null 2>&1
+        return 1
+    }
     protect_dhcp
-    verify_dns
+    if ! verify_dns; then
+        warn "DNS 验证失败，自动还原最近一次备份..."
+        restore_dns >/dev/null 2>&1
+        return 1
+    fi
 }
 
 auto_configure() {
@@ -348,12 +394,19 @@ auto_configure() {
 }
 
 manual_configure() {
-    printf "\n请输入 DNS 地址（可输入多个，以空格分隔）：\n> "
+    printf "\n请输入 DNS 地址（可输入多个 IPv4，以空格分隔）：\n> "
     read manual_servers
     [ -n "$manual_servers" ] || {
         warn "未输入 DNS，已取消。"
         return 0
     }
+
+    for ip in $manual_servers; do
+        if ! valid_ip "$ip"; then
+            err "无效的 IPv4 地址：$ip（示例：8.8.8.8 8.8.4.4）"
+            return 0
+        fi
+    done
 
     printf "是否强制上游使用 TCP？[y/N] "
     read force_tcp
@@ -395,6 +448,14 @@ restore_dns() {
 
     chattr -i /etc/resolv.conf 2>/dev/null || true
     cp "$latest" /etc/resolv.conf || return 1
+
+    # 同时还原 unbound 配置（与 resolv.conf 同时间点备份）
+    latest_u=$(ls -t "$BACKUP_DIR"/unbound.conf.* 2>/dev/null | head -1)
+    if [ -n "$latest_u" ] && [ -f "$UNBOUND_CONF" ]; then
+        cp "$latest_u" "$UNBOUND_CONF" 2>/dev/null &&
+            info "已还原 unbound 配置：$latest_u"
+    fi
+
     rm -f "$MANAGED_MARKER"
 
     if [ "$INIT" = "openrc" ]; then
