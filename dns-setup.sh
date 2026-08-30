@@ -465,9 +465,19 @@ restore_dns() {
             info "已还原 unbound 配置：$latest_u"
     fi
 
-    rm -f "$MANAGED_MARKER"
-
-    if [ "$INIT" = "openrc" ]; then
+    # 判断还原后的 resolv.conf 是否仍依赖本地 unbound（127.0.0.1/::1）。
+    # 若仍指向本地 unbound 却停止服务，会导致 DNS 全面中断。
+    if grep -qE '^nameserver[[:space:]]+(127\.0\.0\.1|::1)' /etc/resolv.conf 2>/dev/null; then
+        info "备份中的 resolv.conf 仍指向本地 unbound，保持 unbound 运行并继续托管。"
+        touch "$MANAGED_MARKER" 2>/dev/null || true
+        chattr +i /etc/resolv.conf 2>/dev/null || true
+        if [ "$INIT" = "openrc" ]; then
+            rc-service unbound restart >/dev/null 2>&1 || rc-service unbound start >/dev/null 2>&1 || true
+            rc-update add unbound default >/dev/null 2>&1 || true
+        elif [ "$INIT" = "systemd" ]; then
+            systemctl restart unbound >/dev/null 2>&1 || systemctl enable --now unbound >/dev/null 2>&1 || true
+        fi
+    elif [ "$INIT" = "openrc" ]; then
         rc-service unbound stop >/dev/null 2>&1 || true
         rc-update del unbound default >/dev/null 2>&1 || true
     elif [ "$INIT" = "systemd" ]; then
