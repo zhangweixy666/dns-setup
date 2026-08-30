@@ -65,7 +65,7 @@ wget -qO- https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-set
 
 ```text
 ========================================
-       通用 DNS 配置工具 v2.1.0
+       通用 DNS 配置工具 v2.2.1
 ========================================
 系统：Alpine Linux（openrc）
 
@@ -137,7 +137,9 @@ UDP 全部不可用：选择最快 TCP
 
 ### 4. 还原上一次备份的 DNS
 
-还原最近一次备份的 `/etc/resolv.conf`，删除 DNS 托管标记，并停止 unbound。
+还原最近一次备份的 `/etc/resolv.conf` 和对应的 unbound 配置。
+
+如果备份中的 `resolv.conf` 仍指向本地 unbound（`127.0.0.1`），脚本会保持 unbound 运行、保留 DNS 托管标记并维持开机自启，避免还原后 DNS 中断；只有备份内容不依赖本地 unbound 时，才会停止 unbound 并移除开机自启。
 
 备份目录：
 
@@ -330,6 +332,14 @@ lsattr /etc/resolv.conf
 - 生产环境请先确认云厂商安全组和容器网络策略。
 - 本项目只负责 DNS 配置，不负责 AKDNS 控制台中的解锁授权。
 - 请在自己拥有或获授权管理的服务器上使用。
+
+## 📜 更新记录
+
+### v2.2.1（2026-08-30）
+
+- 修复：`--restore` 还原后若备份的 `resolv.conf` 仍指向本地 unbound（`127.0.0.1`），保持 unbound 运行并继续托管，避免出现“还原完成后 DNS 解析失败”的问题。
+- 修复：仅当还原内容不依赖本地 unbound 时，才停止 unbound 并移除开机自启。
+- README：菜单示例版本号与还原行为说明同步更新。
 
 ## 📄 License
 
