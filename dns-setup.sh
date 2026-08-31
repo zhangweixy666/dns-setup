@@ -1,11 +1,11 @@
 #!/bin/sh
 # dns-setup.sh - 通用 DNS 配置工具
-# 版本：2.2.0
+# 版本：2.2.2
 # 自动从 AKDNS 官方脚本读取节点；每个节点测速 2 次（节点间并发）
 # 支持 Alpine/openrc、Debian/Ubuntu/systemd，防止 DHCP 覆盖 resolv.conf
 # v2.2.0 新增：验证失败自动回滚、手动输入 IPv4 校验、并发测速、unbound.conf 一并还原
 
-VERSION="2.2.1"
+VERSION="2.2.2"
 AKDNS_URL="https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh"
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 BACKUP_DIR="/var/lib/dns-setup/backup"
@@ -26,6 +26,33 @@ info() { printf "${C}[信息]${N} %s\n" "$*"; }
 warn() { printf "${Y}[警告]${N} %s\n" "$*"; }
 err() { printf "${R}[错误]${N} %s\n" "$*"; }
 pause() { printf "\n按回车键返回菜单..."; read _dummy; }
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        err "需要 root 权限运行，请使用 sudo 或切换到 root 用户。"
+        exit 1
+    fi
+}
+
+ask_yes() {
+    # 返回 0=确认，1=拒绝。stdin 结束（EOF）时默认拒绝，
+    # 避免在管道/无人值守场景下静默应用配置。
+    if ! read answer; then
+        answer="n"
+    fi
+    case "$answer" in
+        n|N|no|NO) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+require_tty() {
+    # 交互菜单依赖 stdin，非终端环境（curl | sh）下会无限循环刷屏
+    if [ ! -t 0 ]; then
+        err "当前不是交互式终端，请使用命令行参数：--auto / --status / --restore"
+        exit 2
+    fi
+}
 
 detect_system() {
     if [ -f /etc/alpine-release ]; then
@@ -62,13 +89,48 @@ ensure_deps() {
     fi
 }
 
+mkdir -p /var/lib/dns-setup 2>/dev/null || true
+RAW_HOST="raw.githubusercontent.com"
+RAW_IP_CACHE="/var/lib/dns-setup/raw_ip"
+
+fetch_by_ip() {
+    # DNS 已经坏了的时候，还需要下载 AKDNS 脚本才能修 DNS（鸡生蛋）。
+    # 这里用公共解析器直接拿 raw.githubusercontent.com 的 IP 绕过本机 DNS。
+    host="$1"
+    url="$2"
+    output="$3"
+    ip=""
+    for resolver in 1.1.1.1 8.8.8.8 9.9.9.9; do
+        ip=$(dig +short +time=3 +tries=1 @$resolver "$host" A 2>/dev/null |
+            grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -1)
+        [ -n "$ip" ] && break
+    done
+    if [ -z "$ip" ] && [ -f "$RAW_IP_CACHE" ]; then
+        ip=$(cat "$RAW_IP_CACHE" 2>/dev/null | head -1)
+    fi
+    [ -n "$ip" ] || return 1
+    mkdir -p "$(dirname "$RAW_IP_CACHE")" 2>/dev/null || true
+    printf '%s\n' "$ip" > "$RAW_IP_CACHE" 2>/dev/null || true
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 8 --resolve "$host:443:$ip" "$url" -o "$output"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --timeout=10 --header="Host: $host" -O "$output" "https://$ip/${url#https://$host}"
+    else
+        return 1
+    fi
+}
+
 download_text() {
     output="$1"
     if command -v wget >/dev/null 2>&1; then
-        wget -qO "$output" "$AKDNS_URL"
-    else
-        curl -fsSL "$AKDNS_URL" -o "$output"
+        wget -q -T 15 -O "$output" "$AKDNS_URL" && return 0
     fi
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 8 "$AKDNS_URL" -o "$output" && return 0
+    fi
+    # 常规下载失败（多半是本机 DNS 已断），走 IP 直连兜底
+    info "常规下载失败，尝试绕过本机 DNS 直连获取..."
+    fetch_by_ip "$RAW_HOST" "$AKDNS_URL" "$output"
 }
 
 load_akdns_nodes() {
@@ -94,6 +156,16 @@ load_akdns_nodes() {
     fi
 
     ok "已读取 AKDNS 节点：$DNS_LIST"
+}
+
+valid_ip6() {
+    # 粗校验 IPv6：只允许 hex 与 :，必须含 :: 或 8 组
+    case "$1" in
+        *:*) ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$1" | grep -qE '^[0-9A-Fa-f:]+(\.[0-9A-Fa-f]+)?$' || return 1
+    return 0
 }
 
 valid_ip() {
@@ -170,6 +242,16 @@ scan_dns() {
     best_tcp_line=$(awk '$3 < 1000 {print $3, $1}' "$scan_file" |
         sort -n | head -1)
 
+    # 除最快节点外，把其余可用节点作为备用上游（最多 3 个）
+    BACKUP_SERVERS=""
+    if [ -n "$best_udp_line" ]; then
+        BACKUP_SERVERS=$(awk '$2 < 1000 {print $2, $1}' "$scan_file" |
+            sort -n | awk 'NR>1 && n<3 {printf "%s ", $2; n++}')
+    else
+        BACKUP_SERVERS=$(awk '$3 < 1000 {print $3, $1}' "$scan_file" |
+            sort -n | awk 'NR>1 && n<3 {printf "%s ", $2; n++}')
+    fi
+
     if [ -n "$best_udp_line" ]; then
         best_ms=$(echo "$best_udp_line" | awk '{print $1}')
         CHOSEN_SERVER=$(echo "$best_udp_line" | awk '{print $2}')
@@ -226,7 +308,15 @@ CONF
         if [ "$proto" = "tcp" ]; then
             printf '    forward-tcp-upstream: yes\n'
         fi
-        for dns in $servers; do
+        # 首选节点写在最前，其余可用节点作为备用一并写入：
+        # 单个上游节点随时可能下线，只配一条会在节点失效时
+        # 造成本机 DNS 全面中断（unbound 仍显示 started 但解析全失败）。
+        seen_dns=" "
+        for dns in $PRIMARY_SERVER $servers ${BACKUP_SERVERS:-}; do
+            case "$seen_dns" in
+                *" $dns "*) continue ;;
+            esac
+            seen_dns="$seen_dns$dns "
             printf '    forward-addr: %s@53\n' "$dns"
         done
     } > "$UNBOUND_CONF"
@@ -239,17 +329,45 @@ CONF
     ok "unbound 配置已生成，协议：$proto，上游：$servers"
 }
 
+unbound_running() {
+    if [ "$INIT" = "openrc" ]; then
+        rc-service unbound status 2>/dev/null | grep -q 'status: started'
+    elif [ "$INIT" = "systemd" ]; then
+        systemctl is-active --quiet unbound
+    else
+        return 1
+    fi
+}
+
 restart_unbound() {
     if [ "$INIT" = "openrc" ]; then
-        rc-service unbound restart || rc-service unbound start
+        rc-service unbound restart >/dev/null 2>&1 ||
+            rc-service unbound start >/dev/null 2>&1
+        # OpenRC stale 状态下 restart 可能返回 0 但进程没起来，必须实测端口
+        if ! unbound_running; then
+            rc-service unbound stop >/dev/null 2>&1
+            sleep 1
+            rc-service unbound start >/dev/null 2>&1
+        fi
         rc-update add unbound default >/dev/null 2>&1 || true
     elif [ "$INIT" = "systemd" ]; then
-        systemctl enable --now unbound
-        systemctl restart unbound
+        systemctl enable --now unbound >/dev/null 2>&1
+        systemctl restart unbound >/dev/null 2>&1
+        if ! unbound_running; then
+            systemctl stop unbound >/dev/null 2>&1
+            sleep 1
+            systemctl start unbound >/dev/null 2>&1
+        fi
     else
         err "无法识别 init 系统，不能自动启动 unbound。"
         return 1
     fi
+
+    if ! unbound_running; then
+        err "unbound 未能进入运行状态。"
+        return 1
+    fi
+    ok "unbound 已运行。"
 }
 
 write_resolv() {
@@ -262,11 +380,19 @@ write_resolv() {
 protect_dhcp() {
     changed=0
 
+    # 容器缺少 CAP_LINUX_IMMUTABLE 时，chattr +i 可能返回 0 却没真正
+    # 设置标志，必须用 lsattr 复核，否则会误报「已锁定」。
+    immutable_ok=0
     if chattr +i /etc/resolv.conf 2>/dev/null; then
-        ok "已锁定 /etc/resolv.conf，防止 DHCP 覆盖。"
-        changed=1
-    else
-        warn "当前容器不支持 chattr +i，将使用 DHCP 脚本保护。"
+        if lsattr /etc/resolv.conf 2>/dev/null |
+            awk '{print $1}' | grep -q 'i'; then
+            immutable_ok=1
+            ok "已锁定 /etc/resolv.conf，防止 DHCP 覆盖。"
+            changed=1
+        fi
+    fi
+    if [ "$immutable_ok" -eq 0 ]; then
+        warn "当前环境不支持 chattr +i（容器权限受限），改由 DHCP 脚本保护。"
     fi
 
     udhcpc_script="/usr/share/udhcpc/default.script"
@@ -275,7 +401,9 @@ protect_dhcp() {
             cp -p "$udhcpc_script" "${udhcpc_script}.dns-setup-bak"
             tmp="${udhcpc_script}.tmp.$$"
             in_func=0
-            while IFS= read -r line; do
+            # 用 `|| [ -n "$line" ]` 兜住文件末尾无换行的情况，
+            # 否则 while read 会丢掉最后一行（如 exit 0）。
+            while IFS= read -r line || [ -n "$line" ]; do
                 printf '%s\n' "$line"
                 if echo "$line" | grep -q '^resolv_conf()'; then
                     in_func=1
@@ -286,7 +414,12 @@ protect_dhcp() {
                     in_func=0
                 fi
             done < "$udhcpc_script" > "$tmp"
-            mv "$tmp" "$udhcpc_script"
+            if [ ! -s "$tmp" ]; then
+                rm -f "$tmp"
+                warn "udhcpc 脚本保护写入异常，已放弃修改。"
+            else
+                mv "$tmp" "$udhcpc_script"
+            fi
             chmod +x "$udhcpc_script"
             ok "已保护 udhcpc default.script，续租时不会覆写 DNS。"
             changed=1
@@ -296,16 +429,36 @@ protect_dhcp() {
         fi
     fi
 
-    if command -v dhcpcd >/dev/null 2>&1; then
-        hook_dir="/etc/dhcpcd.enter-hooks.d"
-        mkdir -p "$hook_dir"
-        cat > "$hook_dir/50-dns-setup-protect" <<HOOK
+    if command -v dhcpcd >/dev/null 2>&1 ||
+        [ -x /sbin/dhcpcd ] || [ -x /usr/sbin/dhcpcd ]; then
+        # dhcpcd-run-hooks 只加载三个位置：/etc/dhcpcd.enter-hook、
+        # /usr/lib/dhcpcd/dhcpcd-hooks/*、/etc/dhcpcd.exit-hook。
+        # enter-hook 最先被 source，在此屏蔽 resolv.conf 钩子即可阻止覆写。
+        hook_file="/etc/dhcpcd.enter-hook"
+        if [ -f "$hook_file" ] &&
+            grep -q 'DNS-SETUP-MANAGED' "$hook_file"; then
+            ok "dhcpcd enter-hook 已受保护。"
+            changed=1
+        elif cat > "$hook_file" <<HOOK
 # DNS-SETUP-MANAGED
-[ -f "$MANAGED_MARKER" ] && make_resolv_conf() { :; }
+if [ -f "$MANAGED_MARKER" ]; then
+    skip_hooks="$skip_hooks resolv.conf"
+    make_resolv_conf() { :; }
+    build_resolv_conf() { :; }
+fi
 HOOK
-        ok "已添加 dhcpcd DNS 保护钩子。"
-        changed=1
+        then
+            chmod 644 "$hook_file" 2>/dev/null || true
+            ok "已写入 dhcpcd 保护钩子：$hook_file"
+            changed=1
+        else
+            warn "无法写入 $hook_file，跳过该项保护。"
+        fi
     fi
+
+    # 清理旧版本写错位置的残留（不被 dhcpcd 加载）
+    rm -f /etc/dhcpcd.enter-hooks.d/50-dns-setup-protect 2>/dev/null || true
+    rm -f /usr/lib/dhcpcd/dhcpcd-hooks.d/50-dns-setup-protect 2>/dev/null || true
 
     if [ "$INIT" = "systemd" ] &&
         systemctl is-active systemd-resolved >/dev/null 2>&1; then
@@ -331,11 +484,20 @@ backup_current() {
         cp -p "$UNBOUND_CONF" "$BACKUP_DIR/unbound.conf.$timestamp" 2>/dev/null || true
 }
 
+dns_probe_ok() {
+    # 只接受真正的解析结果行：dig 出错时（connection refused / no servers
+    # could be reached）会把含数字的错误文本写到 stdout，必须过滤 ^; 注释行，
+    # 并严格匹配整行 IP，否则会把失败误判为成功。
+    dig @127.0.0.1 "$1" +short +time=2 +tries=1 2>/dev/null |
+        grep -vE '^[[:space:]]*;' |
+        grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]*[0-9A-Fa-f:]+:[0-9A-Fa-f:]*$'
+}
+
 wait_dns_ready() {
     # 等待 unbound 准备好并能解析，最多 10 秒
     i=0
     while [ "$i" -lt 10 ]; do
-        if dig @127.0.0.1 "$TEST_DOMAIN" +time=2 +tries=1 +short 2>/dev/null | grep -qE '[0-9]'; then
+        if dns_probe_ok "$TEST_DOMAIN"; then
             return 0
         fi
         i=$((i + 1))
@@ -352,6 +514,10 @@ verify_dns() {
         return 1
     fi
     ip=$(getent hosts "$TEST_DOMAIN" 2>/dev/null | awk 'NR==1 {print $1}')
+    if [ -z "$ip" ]; then
+        err "getent 无法解析 $TEST_DOMAIN（unbound 可能未真正接管）。"
+        return 1
+    fi
     ok "$TEST_DOMAIN 解析成功：$ip"
 
     if command -v curl >/dev/null 2>&1; then
@@ -368,6 +534,14 @@ apply_dns() {
     servers="$1"
     proto="$2"
     backup_current || return 1
+    # 记录本次改动前的 resolv.conf，任何一步失败都要完整退回
+    pre_resolv=$(mktemp /tmp/dns-pre.XXXXXX) || return 1
+    cp -p /etc/resolv.conf "$pre_resolv" 2>/dev/null || : > "$pre_resolv"
+    if lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+        pre_immutable=1
+    else
+        pre_immutable=0
+    fi
     write_unbound_conf "$servers" "$proto" || return 1
     if ! restart_unbound; then
         err "unbound 启动失败，正在还原最近备份..."
@@ -381,10 +555,18 @@ apply_dns() {
     }
     protect_dhcp
     if ! verify_dns; then
-        warn "DNS 验证失败，自动还原最近一次备份..."
-        restore_dns >/dev/null 2>&1
+        warn "DNS 验证失败，回滚本次改动..."
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        if [ -s "$pre_resolv" ]; then
+            cp "$pre_resolv" /etc/resolv.conf 2>/dev/null
+        else
+            restore_dns >/dev/null 2>&1
+        fi
+        [ "$pre_immutable" -eq 1 ] && chattr +i /etc/resolv.conf 2>/dev/null
+        rm -f "$pre_resolv"
         return 1
     fi
+    rm -f "$pre_resolv"
 }
 
 auto_configure() {
@@ -392,13 +574,14 @@ auto_configure() {
     load_akdns_nodes || return 1
     scan_dns || return 1
 
-    printf "\n将使用 %s（%s）作为上游，确认应用？[Y/n] " \
-        "$CHOSEN_SERVER" "$CHOSEN_PROTO"
-    read confirm
-    case "$confirm" in
-        n|N) info "已取消。"; return 0 ;;
-    esac
+    printf "\n将使用 %s（%s）作为上游，备用 %s，确认应用？[Y/n] " \
+        "$CHOSEN_SERVER" "$CHOSEN_PROTO" "${BACKUP_SERVERS:-无}"
+    ask_yes || {
+        info "已取消。"
+        return 0
+    }
 
+    PRIMARY_SERVER="$CHOSEN_SERVER"
     apply_dns "$CHOSEN_SERVER" "$CHOSEN_PROTO"
 }
 
@@ -411,14 +594,18 @@ manual_configure() {
     }
 
     for ip in $manual_servers; do
-        if ! valid_ip "$ip"; then
-            err "无效的 IPv4 地址：$ip（示例：8.8.8.8 8.8.4.4）"
+        if ! valid_ip "$ip" && ! valid_ip6 "$ip"; then
+            err "无效的 DNS 地址：$ip（示例：8.8.8.8 8.8.4.4 或 2606:4700::1111）"
             return 0
         fi
     done
 
     printf "是否强制上游使用 TCP？[y/N] "
-    read force_tcp
+    if read force_tcp; then
+        :
+    else
+        force_tcp="n"
+    fi
     manual_proto="udp"
     case "$force_tcp" in
         y|Y) manual_proto="tcp" ;;
@@ -449,18 +636,33 @@ show_status() {
 }
 
 restore_dns() {
-    latest=$(ls -t "$BACKUP_DIR"/resolv.conf.* 2>/dev/null | head -1)
+    # 按时间戳配对：同一 timestamp 的 resolv.conf 与 unbound.conf 属于同一次备份，
+    # 分别取各自最新会导致跨时间点错配。
+    latest=""
+    # 备份文件名内嵌 YYYYmmdd-HHMMSS，字典序即时间序；
+    # 不用 ls -t：同一秒内创建的多个备份 mtime 相同，ls -t 会退化成目录序。
+    for f in $(ls -1 "$BACKUP_DIR"/resolv.conf.* 2>/dev/null | sort -r); do
+        # 跳过空备份：cp 失败或原文件为空时会留下 0 字节文件，
+        # 还原它等于把系统 DNS 清空。
+        if [ ! -s "$f" ]; then
+            warn "跳过空备份文件：$f"
+            continue
+        fi
+        latest="$f"
+        break
+    done
     if [ -z "$latest" ]; then
         err "没有找到可还原的 DNS 备份。"
         return 1
     fi
 
+    stamp=${latest##*resolv.conf.}
     chattr -i /etc/resolv.conf 2>/dev/null || true
     cp "$latest" /etc/resolv.conf || return 1
 
-    # 同时还原 unbound 配置（与 resolv.conf 同时间点备份）
-    latest_u=$(ls -t "$BACKUP_DIR"/unbound.conf.* 2>/dev/null | head -1)
-    if [ -n "$latest_u" ] && [ -f "$UNBOUND_CONF" ]; then
+    # 还原与本次 resolv.conf 同一时间戳的 unbound 配置
+    latest_u="$BACKUP_DIR/unbound.conf.$stamp"
+    if [ -f "$latest_u" ] && [ -s "$latest_u" ] && [ -f "$UNBOUND_CONF" ]; then
         cp "$latest_u" "$UNBOUND_CONF" 2>/dev/null &&
             info "已还原 unbound 配置：$latest_u"
     fi
@@ -485,9 +687,18 @@ restore_dns() {
     fi
     ok "已还原 DNS：$latest"
     cat /etc/resolv.conf
+    # 备份记录的是当时的状态，当时可能本身就是不可用的（例如上游已下线），
+    # 还原成功不等于 DNS 可用，必须实测后如实提示。
+    if wait_dns_ready; then
+        ok "还原后解析正常。"
+    else
+        warn "还原后仍无法解析：该备份对应的上游可能已失效。"
+        warn "可重新运行 --auto 测速并应用可用节点。"
+    fi
 }
 
 menu() {
+    require_tty
     while true; do
         printf "\033c"
         printf "========================================\n"
@@ -500,7 +711,10 @@ menu() {
         printf "  4) 还原上一次备份的 DNS\n"
         printf "  0) 退出\n\n"
         printf "请选择 [0-4]："
-        read choice
+        read choice || {
+            printf "\n输入结束，已退出。\n"
+            return 0
+        }
         case "$choice" in
             1) auto_configure; pause ;;
             2) manual_configure; pause ;;
@@ -513,11 +727,15 @@ menu() {
 }
 
 detect_system
+require_root
 case "${1:-}" in
     --auto)
+        PRIMARY_SERVER=""
+        BACKUP_SERVERS=""
         ensure_deps &&
         load_akdns_nodes &&
         scan_dns &&
+        PRIMARY_SERVER="$CHOSEN_SERVER" &&
         apply_dns "$CHOSEN_SERVER" "$CHOSEN_PROTO"
         exit $?
         ;;

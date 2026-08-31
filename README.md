@@ -23,15 +23,17 @@ README 中的命令均按“一个代码块一个命令”排列，便于直接�
 
 | 功能 | 说明 |
 |------|------|
-| AKDNS 动态测速 | 通过 `wget` 下载 AKDNS 官方脚本并读取其中的 `DNS_LIST` |
+| AKDNS 动态测速 | 下载 AKDNS 官方脚本并读取其中的 `DNS_LIST`；本机 DNS 已断时用公共解析器直连兜底 |
+| 多上游兜底 | 除最快节点外，额外写入最多 3 个可用备用上游，避免单点下线导致整机 DNS 中断 |
 | UDP/TCP 检测 | 每个节点分别测试 UDP 和 TCP，每种协议测试 2 次 |
 | 智能协议选择 | UDP 有可用节点时优先选择最快 UDP；UDP 全部失败时选择最快 TCP |
 | TCP 转发 | 通过 unbound 的 `forward-tcp-upstream: yes` 强制连接上游 TCP/53 |
-| 自定义 DNS | 支持手动输入任意 DNS 服务商地址 |
+| 自定义 DNS | 支持手动输入 IPv4 / IPv6 DNS 服务商地址 |
 | DHCP 防覆盖 | 处理 `chattr`、Alpine `udhcpc`、`dhcpcd` 等常见覆盖来源 |
 | 本地 DNS 入口 | 系统统一使用 `127.0.0.1:53`，由 unbound 负责转发 |
 | 自动备份 | 修改前备份 `/etc/resolv.conf` 和 unbound 配置 |
-| 一键还原 | 还原最近一次 DNS 配置并停止 unbound |
+| 一键还原 | 按时间戳配对还原 resolv.conf 与 unbound 配置，跳过空备份，还原后实测解析 |
+| 失败回滚 | 验证不通过时回滚本次改动（含 resolv.conf 与 immutable 属性） |
 | 中文界面 | 菜单、状态和错误提示均为中文 |
 | 开机自启 | 自动加入 Alpine OpenRC 或 systemd 启动流程 |
 
@@ -65,7 +67,7 @@ wget -qO- https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-set
 
 ```text
 ========================================
-       通用 DNS 配置工具 v2.2.1
+       通用 DNS 配置工具 v2.2.2
 ========================================
 系统：Alpine Linux（openrc）
 
@@ -140,6 +142,8 @@ UDP 全部不可用：选择最快 TCP
 还原最近一次备份的 `/etc/resolv.conf` 和对应的 unbound 配置。
 
 如果备份中的 `resolv.conf` 仍指向本地 unbound（`127.0.0.1`），脚本会保持 unbound 运行、保留 DNS 托管标记并维持开机自启，避免还原后 DNS 中断；只有备份内容不依赖本地 unbound 时，才会停止 unbound 并移除开机自启。
+
+还原时还会：跳过 0 字节的无效备份；按文件名时间戳配对还原对应的 unbound 配置；还原完成后实测解析，若该备份对应的上游已失效会明确提示重新运行 `--auto`。
 
 备份目录：
 
@@ -334,6 +338,23 @@ lsattr /etc/resolv.conf
 - 请在自己拥有或获授权管理的服务器上使用。
 
 ## 📜 更新记录
+
+### v2.2.2（2026-08-31）
+
+- 修复（高危）：`unbound` 只配置单个上游，节点下线后整机 DNS 全断且 unbound 仍显示 started。现在写入最快节点 + 最多 3 个备用上游。
+- 修复（高危）：`--auto` 在本机 DNS 已断时无法下载 AKDNS 脚本（鸡生蛋死锁）。新增公共解析器取 IP + 直连兜底与 IP 缓存。
+- 修复（高危）：`wait_dns_ready` 用 `grep [0-9]` 判断解析成功，而 dig 失败时会把含数字的错误文本写到 stdout，导致误判成功、自动回滚永不触发。改为过滤 `^;` 注释行并严格匹配整行 IP。
+- 修复（高危）：dhcpcd 保护写入 `/etc/dhcpcd.enter-hooks.d`，该目录不被 `dhcpcd-run-hooks` 加载，保护静默失效。改用官方保证加载的 `/etc/dhcpcd.enter-hook` 设置 `skip_hooks`，并清理旧位置残留。
+- 修复：非交互（`curl | sh`）时菜单 `read` 遇 EOF 不报错，造成无限刷屏死循环。新增 `require_tty` 守卫与 EOF 退出。
+- 修复：容器缺少 `CAP_LINUX_IMMUTABLE` 时 `chattr +i` 返回 0 但未生效，脚本误报“已锁定”。现在用 `lsattr` 复核并如实警告。
+- 修复：`restore_dns` 用 `ls -t` 选备份，同秒创建的备份 mtime 相同会退化为目录序而还原到最旧备份；改为按文件名时间戳倒序。
+- 修复：`restore_dns` 分别取 resolv.conf 与 unbound.conf 的最新文件，跨时间点错配；改为按同一时间戳配对。
+- 修复：0 字节备份会被还原成空 `resolv.conf` 并触发停止 unbound，导致 DNS 彻底中断；现在跳过空备份，全空时拒绝还原。
+- 修复：`apply_dns` 验证失败时只调 `restore_dns`（会还原到上一次备份而非改动前状态），且未恢复 immutable 属性；现在先快照本次改动前的 resolv.conf 并完整回滚。
+- 修复：`restart_unbound` 不确认服务真的起来（OpenRC stale 态下 restart 返回 0 但进程未启动）。新增 `unbound_running` 校验与二次重启兜底。
+- 修复：`protect_dhcp` 改写 udhcpc 脚本时，文件末尾无换行会丢失最后一行（如 `exit 0`）。
+- 新增：root 权限检查；手动输入支持 IPv6；`--restore` 后实测解析并提示；确认提示在 EOF 下默认拒绝而非静默应用。
+- 修正：文件头注释版本号与 `VERSION` 不一致（2.2.0 / 2.2.1）。
 
 ### v2.2.1（2026-08-30）
 
