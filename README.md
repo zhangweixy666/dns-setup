@@ -67,7 +67,7 @@ wget -qO- https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-set
 
 ```text
 ========================================
-       通用 DNS 配置工具 v2.2.2
+       通用 DNS 配置工具 v2.3.0
 ========================================
 系统：Alpine Linux（openrc）
 
@@ -169,6 +169,12 @@ sh /root/dns-setup.sh --status
 
 ```sh
 sh /root/dns-setup.sh --restore
+```
+
+预演模式（只打印将写入的配置，不修改任何文件）：
+
+```sh
+sh /root/dns-setup.sh --dry-run
 ```
 
 ## 🌐 DNS 转发原理
@@ -338,6 +344,21 @@ lsattr /etc/resolv.conf
 - 请在自己拥有或获授权管理的服务器上使用。
 
 ## 📜 更新记录
+
+### v2.3.0（2026-10-18）
+
+本轮聚焦「失败原子性」：每个改动都必须能被安全撤销，绝不把系统留在看似正常、重启才炸的状态。
+
+- 修复（高危）：`write_unbound_conf` 先写生产文件再 `unbound-checkconf` 校验，校验失败直接 return，坏配置已落盘。当下 unbound 还跑旧内存配置看不出问题，下次重启就再也起不来。改为写临时文件 → 校验 → `mv` 原子替换，校验失败原配置分毫不动。
+- 修复（高危）：`/etc/resolv.conf` 是符号链接时（Debian/Ubuntu 上 systemd-resolved 指向 `/run/systemd/resolve/stub-resolv.conf`），`>` 写入会穿透链接落到 tmpfs，重启全丢，`chattr` 也加在 tmpfs 上无效。新增 `unlink_resolv` 先记录原链接目标再替换为实体文件。
+- 修复（高危）：`protect_dhcp` 用 `cat >` 无条件 truncate `/etc/dhcpcd.enter-hook`。这是系统级共享钩子，其他软件（NetworkManager / 云厂商 agent / 自定义 hook）写在这里的内容会被静默清空。改为追加写入并加 BEGIN/END 标记，便于精确撤销。
+- 修复（高危）：验证失败只恢复 `/etc/resolv.conf`，但 `MANAGED_MARKER`、udhcpc 插桩、dhcpcd 钩子、systemd-resolved 停用状态全部保留。结果 DNS 恢复成 DHCP 下发的旧值，可这个旧值从此再也不会被 DHCP 更新——换机房、换子网、续租拿到新 DNS 全部失效且无任何报错。新增 `save_pre_state` / `rollback_changes` / `restore_dhcp_guards` 统一完整回滚。
+- 修复（高危）：`--restore` 还原成不依赖本地 unbound 的静态 DNS 后，没有清理托管标记与 DHCP 保护，同样造成 DHCP 被永久屏蔽。现在同步撤销。
+- 修复：`write_resolv` 最后一句是 `ok()`（恒为真），写入失败也返回 0，导致 `apply_dns` 里的回滚分支永远不会执行。改为失败返回非 0。
+- 修复：没有中断保护。`apply_dns` 中途被 Ctrl+C / SSH 断开 / timeout 杀掉时，可能停在「unbound.conf 已换新、resolv.conf 还是旧值」的半成品态。新增 `trap 'on_interrupt' INT TERM`。
+- 修复：`do-ip6: no` 写死，手动输入的 IPv6 上游能通过校验并写入 `forward-addr`，但 unbound 根本不会去连，必然 verify 失败回滚——README 宣称的 IPv6 支持实际不可用。现在按上游地址族动态生成。
+- 修复：`valid_ip6` 的 `^[0-9A-Fa-f:]+$` 会放行 `:::::`、`12345::` 这类非法地址，同时拒绝 `::ffff:127.0.0.1`。改为按 8 组 / `::` 压缩一次的严格校验，只用 busybox awk 支持的内置函数（busybox 无 `rindex()`）。
+- 新增：`--dry-run` 预演模式，只打印将写入的 `unbound.conf`、`resolv.conf` 与 DHCP 保护动作，不修改任何文件。
 
 ### v2.2.2（2026-08-31）
 

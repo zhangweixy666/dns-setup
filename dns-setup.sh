@@ -1,15 +1,20 @@
 #!/bin/sh
 # dns-setup.sh - 通用 DNS 配置工具
-# 版本：2.2.2
+# 版本：2.3.0
 # 自动从 AKDNS 官方脚本读取节点；每个节点测速 2 次（节点间并发）
 # 支持 Alpine/openrc、Debian/Ubuntu/systemd，防止 DHCP 覆盖 resolv.conf
 # v2.2.0 新增：验证失败自动回滚、手动输入 IPv4 校验、并发测速、unbound.conf 一并还原
 
-VERSION="2.2.2"
+VERSION="2.3.0"
 AKDNS_URL="https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh"
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 BACKUP_DIR="/var/lib/dns-setup/backup"
 MANAGED_MARKER="/etc/dns-setup-managed"
+RESOLV_LINK_SAVE="/var/lib/dns-setup/resolv.link"
+PRE_STATE_DIR=""
+ROLLBACK_NEEDED=0
+CLEANUP_TMP=""
+DRY_RUN=0
 TEST_DOMAIN="www.google.com"
 COUNT=2
 TIMEOUT=1
@@ -159,13 +164,39 @@ load_akdns_nodes() {
 }
 
 valid_ip6() {
-    # 粗校验 IPv6：只允许 hex 与 :，必须含 :: 或 8 组
+    # 严格校验 IPv6：必须是 8 组 hex（允许 :: 压缩一次），或 IPv4 映射地址。
+    # 旧实现 ^[0-9A-Fa-f:]+$ 会放行 ":::::"、"12345::" 这类非法地址。
     case "$1" in
         *:*) ;;
         *) return 1 ;;
     esac
-    printf '%s\n' "$1" | grep -qE '^[0-9A-Fa-f:]+(\.[0-9A-Fa-f]+)?$' || return 1
-    return 0
+    # 注意：Alpine 的 /bin/sh 配 busybox awk，没有 rindex()。
+    # 这里只用 split / length / index / sub 这些 POSIX 基础能力实现。
+    printf '%s\n' "$1" | awk '
+        {
+            s = $0
+            if (s ~ /^::ffff:[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { exit 0 }
+            if (s ~ /[^0-9A-Fa-f:]/) exit 1
+            n = split(s, g, ":")
+            cnt = 0
+            for (i = 1; i <= n; i++) {
+                if (g[i] == "") continue
+                if (length(g[i]) > 4) exit 1
+                if (g[i] !~ /^[0-9A-Fa-f]+$/) exit 1
+                cnt++
+            }
+            if (s ~ /::/) {
+                # 剥离第一处 :: 之前的部分，剩下部分不得再含 ::
+                t = s
+                p = index(t, "::")
+                t = substr(t, p + 2)
+                if (t ~ /::/) exit 1
+                if (cnt > 7) exit 1
+                exit 0
+            }
+            if (cnt != 8) exit 1
+            exit 0
+        }'
 }
 
 valid_ip() {
@@ -279,13 +310,30 @@ write_unbound_conf() {
     proto="$2"
     mkdir -p /etc/unbound || return 1
 
+    # 先写临时文件再校验，最后 atomic mv 覆盘。
+    # 旧实现直接 > $UNBOUND_CONF，一旦 checkconf 失败就 return，
+    # 坏配置已经落在生产文件上；当下因为旧进程还跑旧内存配置看不出问题，
+    # 下次重启 unbound 就再也起不来，DNS 彻底中断。
+    tmp_conf="${UNBOUND_CONF}.tmp.$$"
+    CLEANUP_TMP="$tmp_conf"
+
     {
-        cat <<'CONF'
+        # do-ip6 必须与上游地址族匹配，且必须写在 server: 块内部。
+        # 写在 forward-zone: 之后会被 unbound-checkconf 判为语法错误；
+        # 写死 no 时手动输入的 IPv6 上游永远不会被真正使用。
+        if printf '%s\n' "$servers" | grep -q ':'; then
+            do_ip6_line="yes"
+        else
+            do_ip6_line="no"
+        fi
+        # 注意：本 heredoc 内容均为字面量（不含 $ 与反引号），
+        # 去掉引号仅为了让 $do_ip6_line 展开。
+        cat <<CONF
 server:
     interface: 127.0.0.1
     port: 53
     do-ip4: yes
-    do-ip6: no
+    do-ip6: $do_ip6_line
     do-udp: yes
     do-tcp: yes
     access-control: 127.0.0.0/8 allow
@@ -319,13 +367,27 @@ CONF
             seen_dns="$seen_dns$dns "
             printf '    forward-addr: %s@53\n' "$dns"
         done
-    } > "$UNBOUND_CONF"
+    } > "$tmp_conf"
 
-    if ! unbound-checkconf "$UNBOUND_CONF" >/dev/null 2>&1; then
-        err "unbound 配置检查失败："
-        unbound-checkconf "$UNBOUND_CONF"
+    if ! unbound-checkconf "$tmp_conf" >/dev/null 2>&1; then
+        err "unbound 配置检查失败（已放弃写入，原配置未动）："
+        unbound-checkconf "$tmp_conf"
+        rm -f "$tmp_conf"
         return 1
     fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "[dry-run] 将写入 $UNBOUND_CONF："
+        sed 's/^/    | /' "$tmp_conf"
+        rm -f "$tmp_conf"
+        CLEANUP_TMP=""
+        return 0
+    fi
+    if ! mv -f "$tmp_conf" "$UNBOUND_CONF" 2>/dev/null; then
+        err "无法写入 $UNBOUND_CONF（原配置未动）。"
+        rm -f "$tmp_conf"
+        return 1
+    fi
+    CLEANUP_TMP=""
     ok "unbound 配置已生成，协议：$proto，上游：$servers"
 }
 
@@ -370,14 +432,53 @@ restart_unbound() {
     ok "unbound 已运行。"
 }
 
+unlink_resolv() {
+    # Debian/Ubuntu 上 systemd-resolved 会把 /etc/resolv.conf 做成指向
+    # /run/systemd/resolve/stub-resolv.conf 的符号链接。直接 > 写入会穿透
+    # 链接写到 /run（tmpfs），重启全丢，chattr 也加在 tmpfs 上无效。
+    # 这里先把原链接目标记下来备用，再替换成实体文件。
+    if [ -L /etc/resolv.conf ]; then
+        target=$(readlink /etc/resolv.conf 2>/dev/null)
+        if [ ! -f "$RESOLV_LINK_SAVE" ]; then
+            mkdir -p "$(dirname "$RESOLV_LINK_SAVE")" 2>/dev/null || true
+            printf '%s\n' "$target" > "$RESOLV_LINK_SAVE" 2>/dev/null || true
+        fi
+        warn "检测到 /etc/resolv.conf 是符号链接（-> ${target:-?}），改为实体文件。"
+        rm -f /etc/resolv.conf || return 1
+    fi
+    return 0
+}
+
 write_resolv() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "[dry-run] 将写入 /etc/resolv.conf：nameserver 127.0.0.1"
+        if [ -L /etc/resolv.conf ]; then
+            info "[dry-run] 将把符号链接 -> $(readlink /etc/resolv.conf) 替换为实体文件"
+        fi
+        return 0
+    fi
     chattr -i /etc/resolv.conf 2>/dev/null || true
-    printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
-    touch "$MANAGED_MARKER"
+    unlink_resolv || return 1
+    # 写入失败必须返回非 0：旧实现最后一句是 ok()（恒为 true），
+    # 导致 apply_dns 里的 write_resolv || { 回滚 } 永远不会执行。
+    if ! printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf 2>/dev/null; then
+        err "无法写入 /etc/resolv.conf。"
+        return 1
+    fi
+    touch "$MANAGED_MARKER" 2>/dev/null || true
     ok "系统 DNS 已指向本机 unbound：127.0.0.1"
+    return 0
 }
 
 protect_dhcp() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "[dry-run] 将执行 DHCP 防覆盖：chattr +i /etc/resolv.conf（若支持）"
+        [ -f /usr/share/udhcpc/default.script ] &&
+            info "[dry-run] 将插桩 /usr/share/udhcpc/default.script"
+        command -v dhcpcd >/dev/null 2>&1 &&
+            info "[dry-run] 将追加 /etc/dhcpcd.enter-hook"
+        return 0
+    fi
     changed=0
 
     # 容器缺少 CAP_LINUX_IMMUTABLE 时，chattr +i 可能返回 0 却没真正
@@ -439,14 +540,23 @@ protect_dhcp() {
             grep -q 'DNS-SETUP-MANAGED' "$hook_file"; then
             ok "dhcpcd enter-hook 已受保护。"
             changed=1
-        elif cat > "$hook_file" <<HOOK
-# DNS-SETUP-MANAGED
+        elif {
+            # 旧实现用 cat > 无条件 truncate /etc/dhcpcd.enter-hook。
+            # 这是系统级共享钩子，其他软件（NetworkManager/云厂商 agent/
+            # 自定义 hook）写在这里的内容会被静默清空。改为追加。
+            if [ -s "$hook_file" ] && [ -n "$(tail -c 1 "$hook_file" 2>/dev/null)" ]; then
+                printf '\n' >> "$hook_file"
+            fi
+            cat >> "$hook_file" <<HOOK
+# DNS-SETUP-MANAGED-BEGIN
 if [ -f "$MANAGED_MARKER" ]; then
     skip_hooks="$skip_hooks resolv.conf"
     make_resolv_conf() { :; }
     build_resolv_conf() { :; }
 fi
+# DNS-SETUP-MANAGED-END
 HOOK
+        }
         then
             chmod 644 "$hook_file" 2>/dev/null || true
             ok "已写入 dhcpcd 保护钩子：$hook_file"
@@ -469,6 +579,99 @@ HOOK
 
     [ "$changed" -eq 0 ] &&
         warn "没有发现可修改的 DHCP/DNS 管理器，仅完成 resolv.conf 写入。"
+}
+
+save_pre_state() {
+    # 记录本次 apply 改动前的完整状态，供 rollback_changes 使用：
+    # resolv.conf 内容 / immutable 属性 / 是否被接管 / udhcpc 原始脚本存在性 /
+    # dhcpcd 钩子是否存在。旧实现只恢复 resolv.conf，其余改动全部保留，
+    # 导致 DHCP 被永久屏蔽但没有任何提示。
+    PRE_STATE_DIR=$(mktemp -d /tmp/dns-pre.XXXXXX) || return 1
+    cp -p /etc/resolv.conf "$PRE_STATE_DIR/resolv.conf" 2>/dev/null || true
+    if lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
+        printf '1\n' > "$PRE_STATE_DIR/immutable"
+    else
+        printf '0\n' > "$PRE_STATE_DIR/immutable"
+    fi
+    [ -f "$MANAGED_MARKER" ] && : > "$PRE_STATE_DIR/had_marker"
+    [ -f /etc/dhcpcd.enter-hook ] && : > "$PRE_STATE_DIR/had_enter_hook"
+    ROLLBACK_NEEDED=1
+    return 0
+}
+
+restore_dhcp_guards() {
+    # 撤销 protect_dhcp 做的全部改动：
+    # 1) udhcpc default.script 用原始备份还原，并删掉备份文件
+    # 2) dhcpcd enter-hook 只删除本脚本追加的标记段，保留别人的内容
+    udhcpc_script="/usr/share/udhcpc/default.script"
+    udhcpc_bak="${udhcpc_script}.dns-setup-bak"
+    if [ -f "$udhcpc_bak" ]; then
+        if cp -p "$udhcpc_bak" "$udhcpc_script" 2>/dev/null; then
+            rm -f "$udhcpc_bak"
+            info "已还原 udhcpc default.script。"
+        else
+            warn "还原 udhcpc default.script 失败（备份保留：$udhcpc_bak）。"
+        fi
+    fi
+
+    hook_file="/etc/dhcpcd.enter-hook"
+    if [ -f "$hook_file" ] && grep -q 'DNS-SETUP-MANAGED-BEGIN' "$hook_file" 2>/dev/null; then
+        tmp_hook="${hook_file}.tmp.$$"
+        awk '
+            /^# DNS-SETUP-MANAGED-BEGIN$/ { skip = 1; next }
+            /^# DNS-SETUP-MANAGED-END$/ { skip = 0; next }
+            !skip { print }
+        ' "$hook_file" > "$tmp_hook" 2>/dev/null
+        if [ -f "$tmp_hook" ]; then
+            if [ -s "$tmp_hook" ]; then
+                mv "$tmp_hook" "$hook_file" 2>/dev/null && info "已移除 dhcpcd 保护钩子段。"
+            else
+                rm -f "$hook_file" "$tmp_hook" 2>/dev/null
+                info "已移除 dhcpcd 保护钩子文件。"
+            fi
+        fi
+    fi
+}
+
+rollback_changes() {
+    # 统一的撤销入口：apply_dns 失败分支、中断 trap、--restore 共用。
+    # 必须幂等：重复调用不应造成额外破坏。
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+
+    if [ -n "${PRE_STATE_DIR:-}" ] && [ -d "$PRE_STATE_DIR" ]; then
+        if [ -s "$PRE_STATE_DIR/resolv.conf" ]; then
+            cp "$PRE_STATE_DIR/resolv.conf" /etc/resolv.conf 2>/dev/null ||
+                warn "恢复 /etc/resolv.conf 失败。"
+        fi
+        if [ "$(cat "$PRE_STATE_DIR/immutable" 2>/dev/null)" = "1" ]; then
+            chattr +i /etc/resolv.conf 2>/dev/null || true
+        fi
+    fi
+
+    if [ -n "${PRE_STATE_DIR:-}" ] && [ ! -f "$PRE_STATE_DIR/had_marker" ]; then
+        rm -f "$MANAGED_MARKER" 2>/dev/null || true
+    fi
+
+    restore_dhcp_guards
+
+    [ -n "${CLEANUP_TMP:-}" ] && rm -f "$CLEANUP_TMP" 2>/dev/null || true
+    if [ -n "${PRE_STATE_DIR:-}" ] && [ -d "$PRE_STATE_DIR" ]; then
+        rm -rf "$PRE_STATE_DIR" 2>/dev/null || true
+    fi
+    PRE_STATE_DIR=""
+    ROLLBACK_NEEDED=0
+    return 0
+}
+
+on_interrupt() {
+    printf '\n'
+    warn "检测到中断，正在回滚本次未完成的改动..."
+    if [ "$ROLLBACK_NEEDED" -eq 1 ]; then
+        rollback_changes
+        warn "已回滚。请检查 /etc/resolv.conf 与 unbound 状态后再重试。"
+    fi
+    [ -n "${CLEANUP_TMP:-}" ] && rm -f "$CLEANUP_TMP" 2>/dev/null || true
+    exit 130
 }
 
 backup_current() {
@@ -533,40 +736,44 @@ verify_dns() {
 apply_dns() {
     servers="$1"
     proto="$2"
-    backup_current || return 1
-    # 记录本次改动前的 resolv.conf，任何一步失败都要完整退回
-    pre_resolv=$(mktemp /tmp/dns-pre.XXXXXX) || return 1
-    cp -p /etc/resolv.conf "$pre_resolv" 2>/dev/null || : > "$pre_resolv"
-    if lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q 'i'; then
-        pre_immutable=1
-    else
-        pre_immutable=0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "[dry-run] 以下是将要执行的全部改动，不会写入任何文件："
+        write_unbound_conf "$servers" "$proto" || return 1
+        write_resolv || return 1
+        protect_dhcp
+        info "[dry-run] 不会重启 unbound、不会修改 DHCP 配置。"
+        return 0
     fi
-    write_unbound_conf "$servers" "$proto" || return 1
+    backup_current || return 1
+    # 记录本次改动前的完整状态（resolv.conf / immutable / 标记 / 钩子），
+    # 任何一步失败或中断都要完整退回，不只是恢复一个 resolv.conf。
+    save_pre_state || return 1
+    write_unbound_conf "$servers" "$proto" || {
+        rollback_changes
+        return 1
+    }
     if ! restart_unbound; then
-        err "unbound 启动失败，正在还原最近备份..."
-        restore_dns >/dev/null 2>&1
+        err "unbound 启动失败，正在回滚本次改动..."
+        rollback_changes
         return 1
     fi
     write_resolv || {
-        warn "写入 resolv.conf 失败，自动还原最近备份..."
-        restore_dns >/dev/null 2>&1
+        warn "写入 resolv.conf 失败，回滚本次改动..."
+        rollback_changes
         return 1
     }
     protect_dhcp
     if ! verify_dns; then
         warn "DNS 验证失败，回滚本次改动..."
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        if [ -s "$pre_resolv" ]; then
-            cp "$pre_resolv" /etc/resolv.conf 2>/dev/null
-        else
-            restore_dns >/dev/null 2>&1
-        fi
-        [ "$pre_immutable" -eq 1 ] && chattr +i /etc/resolv.conf 2>/dev/null
-        rm -f "$pre_resolv"
+        rollback_changes
         return 1
     fi
-    rm -f "$pre_resolv"
+    if [ -n "$PRE_STATE_DIR" ] && [ -d "$PRE_STATE_DIR" ]; then
+        rm -rf "$PRE_STATE_DIR" 2>/dev/null || true
+    fi
+    PRE_STATE_DIR=""
+    ROLLBACK_NEEDED=0
+    return 0
 }
 
 auto_configure() {
@@ -682,8 +889,17 @@ restore_dns() {
     elif [ "$INIT" = "openrc" ]; then
         rc-service unbound stop >/dev/null 2>&1 || true
         rc-update del unbound default >/dev/null 2>&1 || true
+        # 还原成不依赖本地 unbound 的静态 DNS 后，必须一并撤销托管状态，
+        # 否则 MANAGED_MARKER 和 udhcpc 插桩还在，DHCP 会被永久屏蔽：
+        # 换机房/换子网/续租拿到新 DNS 全部失效，且没有任何报错。
+        rm -f "$MANAGED_MARKER" 2>/dev/null || true
+        restore_dhcp_guards
+        info "已撤销 DNS 托管标记与 DHCP 保护。"
     elif [ "$INIT" = "systemd" ]; then
         systemctl disable --now unbound >/dev/null 2>&1 || true
+        rm -f "$MANAGED_MARKER" 2>/dev/null || true
+        restore_dhcp_guards
+        info "已撤销 DNS 托管标记与 DHCP 保护。"
     fi
     ok "已还原 DNS：$latest"
     cat /etc/resolv.conf
@@ -728,6 +944,9 @@ menu() {
 
 detect_system
 require_root
+# apply_dns 中途被 Ctrl+C / SSH 断开 / timeout 杀掉时，必须回滚，
+# 否则可能停在「unbound.conf 已换新、resolv.conf 还是旧值」的半成品态。
+trap 'on_interrupt' INT TERM
 case "${1:-}" in
     --auto)
         PRIMARY_SERVER=""
@@ -747,11 +966,22 @@ case "${1:-}" in
         restore_dns
         exit $?
         ;;
+    --dry-run)
+        DRY_RUN=1
+        PRIMARY_SERVER=""
+        BACKUP_SERVERS=""
+        ensure_deps &&
+        load_akdns_nodes &&
+        scan_dns &&
+        PRIMARY_SERVER="$CHOSEN_SERVER" &&
+        apply_dns "$CHOSEN_SERVER" "$CHOSEN_PROTO"
+        exit $?
+        ;;
     "")
         menu
         ;;
     *)
-        printf "用法：%s [--auto|--status|--restore]\n" "$0"
+        printf "用法：%s [--auto|--status|--restore|--dry-run]\n" "$0"
         exit 2
         ;;
 esac
