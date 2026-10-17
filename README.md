@@ -67,7 +67,7 @@ wget -qO- https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-set
 
 ```text
 ========================================
-       通用 DNS 配置工具 v2.3.1
+       通用 DNS 配置工具 v2.4.0
 ========================================
 系统：Alpine Linux（openrc）
 
@@ -175,6 +175,18 @@ sh /root/dns-setup.sh --restore
 
 ```sh
 sh /root/dns-setup.sh --dry-run
+```
+
+无人值守（跳过依赖安装确认）：
+
+```sh
+sh /root/dns-setup.sh --yes
+```
+
+一键卸载（恢复原始 resolv.conf、撤销全部 DHCP 保护、停用 unbound）：
+
+```sh
+sh /root/dns-setup.sh --uninstall
 ```
 
 可调参数（环境变量，按需覆盖）：
@@ -352,6 +364,19 @@ lsattr /etc/resolv.conf
 - 请在自己拥有或获授权管理的服务器上使用。
 
 ## 📜 更新记录
+
+### v2.4.0（2026-10-18）
+
+补齐运维闭环：卸载、备份治理、降级容错、参数覆盖。（本项目不再发布 GitHub Release，版本以 tag 为准。）
+
+- 新增：`--uninstall` 一键卸载。按优先级找最近一份**非空且不指向本机 unbound** 的备份恢复 `resolv.conf`；找不到则尝试恢复原符号链接；两者都无时写入公共 DNS 兜底避免直接断网。随后撤销 DHCP 保护、停 unbound 并删开机自启、重新启用被停用的 systemd-resolved、清理标记与缓存。备份目录默认保留不删。
+- 新增：`--yes` / `-y` 无人值守模式，跳过依赖安装确认。
+- 新增：`ensure_deps` 装包前必须确认。之前 `--auto` 会静默 `apk add` / `apt-get install`，在生产机上属于不可接受的副作用。
+- 新增：节点列表缓存降级。AKDNS 官方脚本改了格式（单引号 / 换行分隔 / 变量拼接）导致解析为空时，不再直接失败，改用 `/var/lib/dns-setup/nodes.cache` 上次成功的列表。
+- 新增：备份保留策略。`BACKUP_KEEP`（默认 10）按时间戳保留最近 N 份，防止无限累积占盘。
+- 新增：`resolv.conf` 保留 `search` / `domain` 域。云环境的主机名短名解析依赖它，之前会被直接冲掉。
+- 新增：`options timeout:1 attempts:2`。unbound 若意外挂掉，默认 5 秒 × 2 次会把每个请求卡 10 秒，现在最多 2 秒。
+- 修复（重要）：备份列表不再接受任意文件名。之前 `ls -1 | sort -r` 会把目录里任何 `resolv.conf.*` 文件纳入排序，而字典序里 `unknown` / `bak2` 排在数字之后，倒排时抢占头部——`--restore` 可能把非时间戳文件当成「最新备份」，保留策略也会把真正最新的备份挤出窗口。新增 `list_backups` 只接受 `YYYYMMDD-HHMMSS` 严格格式，并用 `grep -E '^[0-9]{8}-[0-9]{6}$'` 锚定（不用 `case` 定长模式，写错位数会静默全部不匹配）。
 
 ### v2.3.1（2026-10-18）
 

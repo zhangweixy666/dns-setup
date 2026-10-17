@@ -13,6 +13,11 @@ last=$(grep -n '^detect_system$' "$S" | head -1 | cut -d: -f1)
 sed -n "1,$((last-1))p" "$S" > "$W/lib.sh"
 echo 'detect_system() { OS="Alpine Linux"; INIT="openrc"; }' >> "$W/lib.sh"
 
+# 单独提取 list_backups 真实实现，供备份策略/回滚测试复用
+{
+    awk '/^list_backups\(\) \{/,/^\}/' "$S"
+} > "$W/lb.sh"
+
 printf '\n=== A. valid_ip6 严格校验 ===\n'
 . "$W/lib.sh"
 for ip in "2606:4700::1111" "2001:db8::1" "::1" "::ffff:127.0.0.1" "2001:db8:0:0:0:0:0:1"; do
@@ -214,6 +219,75 @@ if unbound-checkconf "$UNBOUND_CONF" >/dev/null 2>&1; then
 else
     ng "生成配置不合法"
 fi
+
+printf '\n=== M. search 域保留 ===\n'
+RS="$W/rs-test"
+printf 'nameserver 10.0.0.1
+search internal.example.com
+' > "$RS"
+sl=$(grep -E '^[[:space:]]*(search|domain)[[:space:]]+' "$RS" 2>/dev/null)
+if [ "$sl" = "search internal.example.com" ]; then
+    okc "正确提取 search 域"
+else
+    ng "search 提取错误：[$sl]"
+fi
+{
+    printf 'nameserver 127.0.0.1
+'
+    [ -n "$sl" ] && printf '%s
+' "$sl"
+} > "$RS"
+if grep -q 'search internal.example.com' "$RS"; then okc "search 已保留"; else ng "search 丢失"; fi
+if grep -q 'nameserver 127.0.0.1' "$RS"; then okc "nameserver 已写入"; else ng "nameserver 缺失"; fi
+
+printf '\n=== N. 备份保留策略只删超额 ===\n'
+BD="$W/bk"
+mkdir -p "$BD"
+for i in 1 2 3 4 5; do
+    printf 'v%s\n' "$i" > "$BD/resolv.conf.2026010${i}-00000${i}"
+done
+printf 'keepme\n' > "$BD/resolv.conf.unknown"
+printf 'junk\n' > "$BD/resolv.conf.bak2"
+BACKUP_KEEP=3
+. "$W/lb.sh"
+BACKUP_DIR="$BD"
+for prefix in resolv.conf unbound.conf; do
+    n=0
+    for f in $(list_backups "$prefix"); do
+        n=$((n + 1))
+        [ "$n" -gt "$BACKUP_KEEP" ] && rm -f "$f" 2>/dev/null || true
+    done
+done
+cnt=$(ls -1 "$BD/resolv.conf."* 2>/dev/null | wc -l)
+# 3 份时间戳备份 + unknown + bak2 = 5 个文件应全部保留
+if [ "$cnt" = "5" ]; then okc "非时间戳文件不占名额（剩 $cnt 个）"; else ng "文件数异常：$cnt"; fi
+if [ -f "$BD/resolv.conf.20260105-000005" ]; then okc "最新备份未误删"; else ng "最新备份被删"; fi
+if [ -f "$BD/resolv.conf.20260101-000001" ]; then ng "超额备份未被清理"; else okc "超额备份已清理"; fi
+
+printf '\n=== O. uninstall 回退优先级 ===\n'
+BD2="$W/bk2"
+mkdir -p "$BD2"
+printf 'nameserver 10.1.1.1
+' > "$BD2/resolv.conf.20260102-000002"
+printf 'nameserver 127.0.0.1
+' > "$BD2/resolv.conf.20260103-000003"
+printf '' > "$BD2/resolv.conf.20260104-000004"
+found=""
+. "$W/lb.sh"
+BACKUP_DIR="$BD2"
+for f in $(list_backups resolv.conf); do
+    [ -s "$f" ] || continue
+    if grep -qE '^[[:space:]]*nameserver[[:space:]]+(127\.0\.0\.1|::1)' "$f" 2>/dev/null; then
+        continue
+    fi
+    found="$f"
+    break
+done
+case "$found" in
+    *20260102*) okc "跳过空备份与本地指向，选中最旧的有效备份" ;;
+    "") ng "未找到可用备份" ;;
+    *) ng "选错备份：$found" ;;
+esac
 
 printf '\n----------------------------------------\n'
 printf 'PASS=%d  FAIL=%d\n' "$PASS" "$FAIL"

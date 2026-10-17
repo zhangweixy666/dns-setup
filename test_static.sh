@@ -45,8 +45,8 @@ grepn() {
 
 printf '\n=== 1. 静态检查 ===\n'
 chk "sh -n 语法通过" sh -n "$S"
-grepq "版本号为 2.3.1" 'VERSION="2.3.1"'
-grepq "头注释版本一致" '# 版本：2.3.1'
+grepq "版本号为 2.4.0" 'VERSION="2.4.0"'
+grepq "头注释版本一致" '# 版本：2.4.0'
 if [ "$(grep -c $'\xef\xbf\xbd' "$S")" = "0" ]; then
     PASS=$((PASS+1)); printf '  [PASS] %s\n' "无 U+FFFD 乱码"
 else
@@ -145,6 +145,36 @@ grepq "logfile 配置" 'logfile: "/var/log/unbound.log"'
 grepq "日志权限处理" 'chown unbound:unbound'
 grepq "无权限时降级" 'LOGFILE_LINES'
 grepq "do-not-query-localhost" 'do-not-query-localhost: yes'
+
+printf '\n=== 16. --uninstall ===\n'
+grepq "uninstall_all 函数" '^uninstall_all() {'
+grepq "uninstall 参数分支" '\-\-uninstall)'
+grepq "uninstall 停服务" 'rc-service unbound stop'
+grepq "uninstall 删自启" 'rc-update del unbound default'
+grepq "uninstall 清标记" 'rm -f "\$MANAGED_MARKER"'
+grepq "uninstall 恢复 resolved" 'systemctl enable --now systemd-resolved'
+grepq "uninstall 公共DNS兜底" 'nameserver 1.1.1.1'
+grepq "uninstall 后验证解析" 'wait_dns_ready; then'
+
+printf '\n=== 17. 依赖安装确认 ===\n'
+grepq "--yes 可跳过确认" 'ASSUME_YES=1'
+grepq "装包前询问" '是否现在安装'
+grepq "dry-run 不装包" 'DRY_RUN" -ne 1 \] && \[ "\$ASSUME_YES"'
+
+printf '\n=== 18. 节点缓存降级 ===\n'
+grepq "NODE_CACHE 定义" 'NODE_CACHE="\/var\/lib\/dns-setup\/nodes.cache"'
+grepq "解析失败读缓存" '上次缓存'
+grepq "成功后写缓存" '> "\$NODE_CACHE"'
+
+printf '\n=== 19. 备份保留策略 ===\n'
+grepq "BACKUP_KEEP 可配" 'BACKUP_KEEP:-10'
+grepq "按时间戳裁剪" 'BACKUP_KEEP" -gt 0'
+grepq "只动两类文件" 'for prefix in resolv.conf unbound.conf'
+
+printf '\n=== 20. resolv.conf 保留 search ===\n'
+grepq "提取 search/domain" 'search_lines='
+grepq "写回 search" '"$search_lines"'
+grepq "超时兜底 options" 'options timeout:1 attempts:2'
 
 printf '\n----------------------------------------\n'
 printf 'PASS=%d  FAIL=%d\n' "$PASS" "$FAIL"

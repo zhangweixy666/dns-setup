@@ -1,11 +1,11 @@
 #!/bin/sh
 # dns-setup.sh - 通用 DNS 配置工具
-# 版本：2.3.1
+# 版本：2.4.0
 # 自动从 AKDNS 官方脚本读取节点；每个节点测速 2 次（节点间并发）
 # 支持 Alpine/openrc、Debian/Ubuntu/systemd，防止 DHCP 覆盖 resolv.conf
 # v2.2.0 新增：验证失败自动回滚、手动输入 IPv4 校验、并发测速、unbound.conf 一并还原
 
-VERSION="2.3.1"
+VERSION="2.4.0"
 AKDNS_URL="https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh"
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 BACKUP_DIR="/var/lib/dns-setup/backup"
@@ -15,6 +15,9 @@ PRE_STATE_DIR=""
 ROLLBACK_NEEDED=0
 CLEANUP_TMP=""
 DRY_RUN=0
+ASSUME_YES=0
+NODE_CACHE="/var/lib/dns-setup/nodes.cache"
+BACKUP_KEEP="${BACKUP_KEEP:-10}"
 # 以下三项可由环境变量覆盖，便于 CDN/故障转移等场景调优：
 #   CACHE_MIN_TTL  —— 强制最小缓存时间。CDN 调度/DDNS 场景应调小（如 60）。
 #   SCAN_TIMEOUT   —— 单次探测超时秒数。繁忙 VPS 上 1s 容易把好节点判死。
@@ -85,6 +88,15 @@ ensure_deps() {
 
     if [ "$need" -eq 0 ]; then
         return 0
+    fi
+
+    # 生产机上静默装包属于副作用，必须让用户确认。
+    if [ "$DRY_RUN" -ne 1 ] && [ "$ASSUME_YES" -ne 1 ]; then
+        printf "缺少依赖（unbound / dig / wget），是否现在安装？[y/N] "
+        if ! ask_yes; then
+            err "已取消（可手动安装后重试）。"
+            return 1
+        fi
     fi
 
     info "正在安装 unbound、dig 和 wget..."
@@ -161,10 +173,20 @@ load_akdns_nodes() {
     rm -f "$akdns_file"
 
     if [ -z "$DNS_LIST" ]; then
-        err "没有从 AKDNS 官方脚本中读取到 DNS_LIST。"
+        # 上游脚本改了格式（单引号/换行分隔/变量拼接）时解析会空。
+        # 这时不应直接失败，用上次成功的列表降级。
+        if [ -s "$NODE_CACHE" ]; then
+            DNS_LIST=$(cat "$NODE_CACHE" 2>/dev/null)
+            if [ -n "$DNS_LIST" ]; then
+                warn "无法从官方脚本解析节点，使用上次缓存：$DNS_LIST"
+                return 0
+            fi
+        fi
+        err "没有从 AKDNS 官方脚本中读取到 DNS_LIST（也无可用缓存）。"
         return 1
     fi
 
+    printf '%s\n' "$DNS_LIST" > "$NODE_CACHE" 2>/dev/null || true
     ok "已读取 AKDNS 节点：$DNS_LIST"
 }
 
@@ -501,12 +523,29 @@ write_resolv() {
         return 0
     fi
     chattr -i /etc/resolv.conf 2>/dev/null || true
+
+    # 先抽走原有的 search / domain 行。云环境的主机名短名解析
+    # （hostname 不带域名）依赖 search 域，丢了会导致内部服务名解析失败。
+    search_lines=""
+    if [ -f /etc/resolv.conf ]; then
+        search_lines=$(grep -E '^[[:space:]]*(search|domain)[[:space:]]+' /etc/resolv.conf 2>/dev/null)
+    fi
+
     unlink_resolv || return 1
     # 写入失败必须返回非 0：旧实现最后一句是 ok()（恒为 true），
     # 导致 apply_dns 里的 write_resolv || { 回滚 } 永远不会执行。
-    if ! printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf 2>/dev/null; then
+    if ! {
+        printf 'nameserver 127.0.0.1\n'
+        [ -n "$search_lines" ] && printf '%s\n' "$search_lines"
+    } > /etc/resolv.conf 2>/dev/null; then
         err "无法写入 /etc/resolv.conf。"
         return 1
+    fi
+    # 兜底超时：unbound 若意外挂掉，默认 5s x 2 次尝试会卡 10 秒。
+    # 设为 1s x 2，最多卡 2 秒。必须写在 options 行且放最后。
+    if [ -f /etc/resolv.conf ] &&
+        ! grep -q '^options' /etc/resolv.conf 2>/dev/null; then
+        printf 'options timeout:1 attempts:2\n' >> /etc/resolv.conf 2>/dev/null || true
     fi
     touch "$MANAGED_MARKER" 2>/dev/null || true
     ok "系统 DNS 已指向本机 unbound：127.0.0.1"
@@ -849,6 +888,24 @@ on_interrupt() {
     exit 130
 }
 
+list_backups() {
+    # 只接受 "<prefix>.YYYYMMDD-HHMMSS" 这种严格格式。
+    # 不这么做的后果：目录里任何 "<prefix>.something" 的文件（手工备份、
+    # 旧版残留、复制品）都会参与排序，而字典序里 "unknown" 排在数字之后，
+    # 倒排时就会抢占头部——导致 restore 把非时间戳文件当成「最新备份」，
+    # 也导致保留策略把真正最新的备份挤出窗口。
+    prefix="$1"
+    for f in $(ls -1 "$BACKUP_DIR/$prefix."* 2>/dev/null | sort -r); do
+        base=${f##*/}
+        stamp=${base#"$prefix".}
+        # 用 grep 做整串锚定，比 case 的定长模式更稳：
+        # case 模式长度写错（比如 8 位 vs 9 位）会静默全部不匹配。
+        if printf '%s\n' "$stamp" | grep -qE '^[0-9]{8}-[0-9]{6}$'; then
+            printf '%s\n' "$f"
+        fi
+    done
+}
+
 backup_current() {
     mkdir -p "$BACKUP_DIR" || return 1
     timestamp=$(date +%Y%m%d-%H%M%S)
@@ -860,6 +917,21 @@ backup_current() {
     fi
     [ -f "$UNBOUND_CONF" ] &&
         cp -p "$UNBOUND_CONF" "$BACKUP_DIR/unbound.conf.$timestamp" 2>/dev/null || true
+
+    # 备份无限累积会慢慢占盘，按时间戳保留最近 N 份。
+    # 注意：不能误删非本脚本产生的文件，只碰 resolv.conf.* 与 unbound.conf.*
+    case "$BACKUP_KEEP" in
+        ''|*[!0-9]*) BACKUP_KEEP=10 ;;
+    esac
+    if [ "$BACKUP_KEEP" -gt 0 ]; then
+        for prefix in resolv.conf unbound.conf; do
+            n=0
+            for f in $(ls -1 "$BACKUP_DIR/$prefix."* 2>/dev/null | sort -r); do
+                n=$((n + 1))
+                [ "$n" -gt "$BACKUP_KEEP" ] && rm -f "$f" 2>/dev/null || true
+            done
+        done
+    fi
 }
 
 dns_probe_ok() {
@@ -1017,6 +1089,75 @@ show_status() {
     verify_dns
 }
 
+uninstall_all() {
+    # 一键清理：把本脚本所有改动逆序撤销，让系统回到干净状态。
+    # 与 rollback_changes 的区别：这里不需要 pre_state 快照，
+    # 是「不管之前怎样，把本项目痕迹全清掉」的语义。
+    info "开始卸载 dns-setup 的全部改动..."
+
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+
+    # 1) 恢复 resolv.conf：优先用最近一份非空、且不指向本机 unbound 的备份
+    restored=0
+    for f in $(list_backups resolv.conf); do
+        [ -s "$f" ] || continue
+        if grep -qE '^[[:space:]]*nameserver[[:space:]]+(127\.0\.0\.1|::1)' "$f" 2>/dev/null; then
+            continue
+        fi
+        if cp "$f" /etc/resolv.conf 2>/dev/null; then
+            ok "已从备份恢复 /etc/resolv.conf：$f"
+            restored=1
+            break
+        fi
+    done
+    if [ "$restored" -eq 0 ]; then
+        warn "未找到可用的原始 resolv.conf 备份。"
+        if [ -f "$RESOLV_LINK_SAVE" ]; then
+            target=$(cat "$RESOLV_LINK_SAVE" 2>/dev/null)
+            if [ -n "$target" ]; then
+                rm -f /etc/resolv.conf 2>/dev/null
+                ln -sf "$target" /etc/resolv.conf 2>/dev/null &&
+                    info "已恢复符号链接 -> $target"
+            fi
+        fi
+        # 没有任何备份时留一个公共 DNS 兜底，避免直接断网
+        if ! grep -qE '^[[:space:]]*nameserver' /etc/resolv.conf 2>/dev/null; then
+            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf 2>/dev/null || true
+            warn "已写入公共 DNS 兜底（1.1.1.1 / 8.8.8.8），请自行改为期望值。"
+        fi
+    fi
+
+    # 2) 撤销 DHCP / DNS 管理器保护
+    restore_dhcp_guards
+
+    # 3) 停止 unbound 并移除开机自启
+    if [ "$INIT" = "openrc" ]; then
+        rc-service unbound stop >/dev/null 2>&1 || true
+        rc-update del unbound default >/dev/null 2>&1 || true
+    elif [ "$INIT" = "systemd" ]; then
+        systemctl disable --now unbound >/dev/null 2>&1 || true
+        # 被 protect_dhcp 停用的 systemd-resolved 需要恢复
+        if [ -f /etc/systemd/resolved.conf ] ||
+            command -v systemd-resolved >/dev/null 2>&1; then
+            systemctl enable --now systemd-resolved >/dev/null 2>&1 || true
+            info "已重新启用 systemd-resolved。"
+        fi
+    fi
+
+    # 4) 清理标记与缓存（不删备份，历史可供 --restore 使用）
+    rm -f "$MANAGED_MARKER" 2>/dev/null || true
+    rm -f "$NODE_CACHE" "$RAW_IP_CACHE" "$RESOLV_LINK_SAVE" 2>/dev/null || true
+
+    # 5) 验证最终可用性
+    if wait_dns_ready; then
+        ok "卸载完成，当前 DNS 可正常解析。"
+    else
+        warn "卸载完成，但当前 DNS 无法解析，请手动检查 /etc/resolv.conf。"
+    fi
+    info "备份目录未删除：$BACKUP_DIR（如需清空请手动 rm -rf）"
+    return 0
+}
+
 restore_dns() {
     # 按时间戳配对：同一 timestamp 的 resolv.conf 与 unbound.conf 属于同一次备份，
     # 分别取各自最新会导致跨时间点错配。
@@ -1141,6 +1282,21 @@ case "${1:-}" in
         restore_dns
         exit $?
         ;;
+    --uninstall)
+        uninstall_all
+        exit $?
+        ;;
+    --yes|-y)
+        ASSUME_YES=1
+        PRIMARY_SERVER=""
+        BACKUP_SERVERS=""
+        ensure_deps &&
+        load_akdns_nodes &&
+        scan_dns &&
+        PRIMARY_SERVER="$CHOSEN_SERVER" &&
+        apply_dns "$CHOSEN_SERVER" "$CHOSEN_PROTO"
+        exit $?
+        ;;
     --dry-run)
         DRY_RUN=1
         PRIMARY_SERVER=""
@@ -1156,7 +1312,7 @@ case "${1:-}" in
         menu
         ;;
     *)
-        printf "用法：%s [--auto|--status|--restore|--dry-run]\n" "$0"
+        printf "用法：%s [--auto|--yes|--status|--restore|--uninstall|--dry-run]\n" "$0"
         exit 2
         ;;
 esac
