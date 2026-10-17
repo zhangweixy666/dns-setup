@@ -45,8 +45,8 @@ grepn() {
 
 printf '\n=== 1. 静态检查 ===\n'
 chk "sh -n 语法通过" sh -n "$S"
-grepq "版本号为 2.3.0" 'VERSION="2.3.0"'
-grepq "头注释版本一致" '# 版本：2.3.0'
+grepq "版本号为 2.3.1" 'VERSION="2.3.1"'
+grepq "头注释版本一致" '# 版本：2.3.1'
 if [ "$(grep -c $'\xef\xbf\xbd' "$S")" = "0" ]; then
     PASS=$((PASS+1)); printf '  [PASS] %s\n' "无 U+FFFD 乱码"
 else
@@ -120,6 +120,31 @@ if grep -q '__DOIP6_PLACEHOLDER__' "$S"; then
 else
     PASS=$((PASS+1)); printf '  [PASS] %s\n' '无占位符残留'
 fi
+
+printf '\n=== 12. v2.3.1 覆盖链 ===\n'
+grepq "NetworkManager drop-in" 'NetworkManager/conf.d/99-dns-setup.conf'
+grepq "NM dns=none" 'dns=none'
+grepq "NM rc-manager=unmanaged" 'rc-manager=unmanaged'
+grepq "networkd drop-in" '99-dns-setup.conf'
+grepq "networkd UseDNS=no" 'UseDNS=no'
+grepq "resolvconf 支持" 'resolvconf.conf'
+grepq "resolvconf name_servers" 'name_servers="127.0.0.1"'
+
+printf '\n=== 13. v2.3.1 回滚完整性 ===\n'
+grepq "回滚删除 NM 配置" 'nm_conf="/etc/NetworkManager'
+grepq "回滚清理 resolvconf" 'tmp_rc='
+
+printf '\n=== 14. v2.3.1 可配置项 ===\n'
+grepq "CACHE_MIN_TTL 可覆盖" 'CACHE_MIN_TTL:-3600'
+grepq "SCAN_TIMEOUT 可覆盖" 'SCAN_TIMEOUT'
+grepq "SCAN_COUNT 可覆盖" 'SCAN_COUNT'
+grepq "TTL 变量生效" 'cache-min-ttl: \$CACHE_MIN_TTL'
+
+printf '\n=== 15. v2.3.1 日志 ===\n'
+grepq "logfile 配置" 'logfile: "/var/log/unbound.log"'
+grepq "日志权限处理" 'chown unbound:unbound'
+grepq "无权限时降级" 'LOGFILE_LINES'
+grepq "do-not-query-localhost" 'do-not-query-localhost: yes'
 
 printf '\n----------------------------------------\n'
 printf 'PASS=%d  FAIL=%d\n' "$PASS" "$FAIL"

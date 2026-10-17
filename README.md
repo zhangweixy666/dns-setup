@@ -67,7 +67,7 @@ wget -qO- https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-set
 
 ```text
 ========================================
-       通用 DNS 配置工具 v2.3.0
+       通用 DNS 配置工具 v2.3.1
 ========================================
 系统：Alpine Linux（openrc）
 
@@ -175,6 +175,14 @@ sh /root/dns-setup.sh --restore
 
 ```sh
 sh /root/dns-setup.sh --dry-run
+```
+
+可调参数（环境变量，按需覆盖）：
+
+```sh
+CACHE_MIN_TTL=60 sh /root/dns-setup.sh --auto   # 强制最小缓存 60 秒（CDN 调度/DDNS 场景）
+SCAN_TIMEOUT=2 sh /root/dns-setup.sh --auto     # 单次探测超时 2 秒（繁忙 VPS）
+SCAN_COUNT=5 sh /root/dns-setup.sh --auto       # 每节点每协议采样 5 次（更稳）
 ```
 
 ## 🌐 DNS 转发原理
@@ -344,6 +352,22 @@ lsattr /etc/resolv.conf
 - 请在自己拥有或获授权管理的服务器上使用。
 
 ## 📜 更新记录
+
+### v2.3.1（2026-10-18）
+
+补齐 DNS 覆盖链、日志与可调参数。
+
+- 新增：NetworkManager 覆盖链。写入 `/etc/NetworkManager/conf.d/99-dns-setup.conf`（`dns=none` + `rc-manager=unmanaged`）。NM 自行管理 resolv.conf 时，之前所有写入都会被它覆盖回去。
+- 新增：systemd-networkd 覆盖链。为每个 `*.network` 创建 `*.network.d/99-dns-setup.conf`（`UseDNS=no`），保留 DHCP 本身工作但阻止 DNS 下发。
+- 新增：openresolv / resolvconf 覆盖链。写入 `/etc/resolvconf.conf` 的 `name_servers="127.0.0.1"`。Debian/Alpine 上这是最常见却被忽略的覆盖源。
+- 新增：上述三条链的回滚。`restore_dhcp_guards` 现在会删除 NM drop-in、networkd drop-in，并用 awk 精确剥离 `resolvconf.conf` 中的标记段（只删自己写的，不碰原有 `search` 等配置）。
+- 新增：unbound 日志。配置 `logfile: "/var/log/unbound.log"` + `log-time-ascii: yes` + `use-syslog: no`。写入前自动创建文件、`chown unbound:unbound`、`chmod 640`；无法创建时自动降级为 `use-syslog: no` 并告警，不会因为日志权限导致 unbound 起不来。
+- 新增：`do-not-query-localhost: yes`，降低被当成开放解析器滥用的风险。
+- 新增：三个环境变量可覆盖参数：
+  - `CACHE_MIN_TTL`（默认 3600）——CDN 调度 / DDNS 场景应调小，如 `60`
+  - `SCAN_TIMEOUT`（默认 1 秒）——繁忙 VPS 上 1 秒容易把好节点判死
+  - `SCAN_COUNT`（默认 2 次）——2 次取平均噪声偏大，建议 5
+- 改进：`--dry-run` 在探测日志可写性时不再创建任何文件，只判断目录权限，保证打印内容与实际写入一致。
 
 ### v2.3.0（2026-10-18）
 

@@ -165,6 +165,56 @@ if [ -L "$LINK" ]; then okc "测试环境符号链接创建成功"; else ng "符
 t=$(readlink "$LINK")
 if [ "$t" = "$TARGET" ]; then okc "readlink 读出目标"; else ng "readlink 失败"; fi
 
+printf '\n=== J. resolvconf.conf 追加与精确移除 ===\n'
+RC="$W/resolvconf.conf"
+printf 'search example.com
+' > "$RC"
+cat >> "$RC" <<'EOS'
+# DNS-SETUP-MANAGED
+name_servers="127.0.0.1"
+EOS
+if grep -q 'name_servers="127.0.0.1"' "$RC"; then okc "resolvconf 配置已追加"; else ng "追加失败"; fi
+if grep -q 'search example.com' "$RC"; then okc "原有内容保留"; else ng "原有内容丢失"; fi
+tmp="$RC.tmp"
+awk '
+    /^# DNS-SETUP-MANAGED$/ { skip = 1; next }
+    skip == 1 && /^name_servers="127\.0\.0\.1"$/ { skip = 2; next }
+    skip == 2 && /^$/ { skip = 0; next }
+    skip == 2 { skip = 0 }
+    { print }
+' "$RC" > "$tmp"
+mv "$tmp" "$RC"
+if grep -q 'name_servers="127.0.0.1"' "$RC"; then ng "标记段未清除"; else okc "标记段已清除"; fi
+if grep -q 'search example.com' "$RC"; then okc "移除后原内容仍在"; else ng "移除误删原内容"; fi
+
+printf '\n=== K. CACHE_MIN_TTL 可覆盖 ===\n'
+mkdir -p "$W/e2/etc/unbound" "$W/e2/bin"
+printf '#!/bin/sh
+exit 0
+' > "$W/e2/bin/unbound-checkconf"
+chmod +x "$W/e2/bin/unbound-checkconf"
+UNBOUND_CONF="$W/e2/etc/unbound/unbound.conf"
+export UNBOUND_CONF
+PATH="$W/e2/bin:$PATH"; export PATH
+CACHE_MIN_TTL=60
+export CACHE_MIN_TTL
+write_unbound_conf "1.1.1.1" "udp" >/dev/null 2>&1
+if grep -q 'cache-min-ttl: 60' "$UNBOUND_CONF"; then
+    okc "CACHE_MIN_TTL=60 生效"
+else
+    ng "CACHE_MIN_TTL 未生效：$(grep cache-min-ttl "$UNBOUND_CONF")"
+fi
+
+printf '\n=== L. 日志配置与降级 ===\n'
+if grep -q 'use-syslog: no' "$UNBOUND_CONF"; then okc "use-syslog: no 已写入"; else ng "use-syslog 缺失"; fi
+if grep -q 'do-not-query-localhost: yes' "$UNBOUND_CONF"; then okc "do-not-query-localhost 已写入"; else ng "缺失"; fi
+# 生成的配置必须本身合法
+if unbound-checkconf "$UNBOUND_CONF" >/dev/null 2>&1; then
+    okc "生成配置通过 checkconf"
+else
+    ng "生成配置不合法"
+fi
+
 printf '\n----------------------------------------\n'
 printf 'PASS=%d  FAIL=%d\n' "$PASS" "$FAIL"
 rm -rf "$W"

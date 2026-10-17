@@ -1,11 +1,11 @@
 #!/bin/sh
 # dns-setup.sh - 通用 DNS 配置工具
-# 版本：2.3.0
+# 版本：2.3.1
 # 自动从 AKDNS 官方脚本读取节点；每个节点测速 2 次（节点间并发）
 # 支持 Alpine/openrc、Debian/Ubuntu/systemd，防止 DHCP 覆盖 resolv.conf
 # v2.2.0 新增：验证失败自动回滚、手动输入 IPv4 校验、并发测速、unbound.conf 一并还原
 
-VERSION="2.3.0"
+VERSION="2.3.1"
 AKDNS_URL="https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh"
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 BACKUP_DIR="/var/lib/dns-setup/backup"
@@ -15,9 +15,14 @@ PRE_STATE_DIR=""
 ROLLBACK_NEEDED=0
 CLEANUP_TMP=""
 DRY_RUN=0
-TEST_DOMAIN="www.google.com"
-COUNT=2
-TIMEOUT=1
+# 以下三项可由环境变量覆盖，便于 CDN/故障转移等场景调优：
+#   CACHE_MIN_TTL  —— 强制最小缓存时间。CDN 调度/DDNS 场景应调小（如 60）。
+#   SCAN_TIMEOUT   —— 单次探测超时秒数。繁忙 VPS 上 1s 容易把好节点判死。
+#   SCAN_COUNT     —— 每个节点每协议采样次数。2 次取平均噪声偏大。
+TEST_DOMAIN="${TEST_DOMAIN:-www.google.com}"
+CACHE_MIN_TTL="${CACHE_MIN_TTL:-3600}"
+COUNT="${SCAN_COUNT:-2}"
+TIMEOUT="${SCAN_TIMEOUT:-1}"
 DNS_LIST=""
 
 G='\033[0;32m'
@@ -317,6 +322,31 @@ write_unbound_conf() {
     tmp_conf="${UNBOUND_CONF}.tmp.$$"
     CLEANUP_TMP="$tmp_conf"
 
+    # 配了 logfile 就必须保证 unbound 能写。否则 unbound 启动失败，
+    # 而症状只是 DNS 不通，很难联想到是日志权限问题。
+    # dry-run 也要探测一次可写性，否则打印出来的配置与实际会写入的不一致。
+    logdir="/var/log"
+    logfile="$logdir/unbound.log"
+    if [ "$DRY_RUN" -ne 1 ]; then
+        mkdir -p "$logdir" 2>/dev/null || true
+        [ -f "$logfile" ] || : >> "$logfile" 2>/dev/null || true
+        if ! touch "$logfile" 2>/dev/null; then
+            warn "无法创建 $logfile，本配置将不启用 logfile。"
+            LOGFILE_OK=0
+        else
+            LOGFILE_OK=1
+            chown unbound:unbound "$logfile" 2>/dev/null || true
+            chmod 640 "$logfile" 2>/dev/null || true
+        fi
+    else
+        # 只判断目录可写，不创建任何文件
+        if [ -w "$logdir" ] || [ -w "$logfile" ]; then
+            LOGFILE_OK=1
+        else
+            LOGFILE_OK=0
+        fi
+    fi
+
     {
         # do-ip6 必须与上游地址族匹配，且必须写在 server: 块内部。
         # 写在 forward-zone: 之后会被 unbound-checkconf 判为语法错误；
@@ -326,8 +356,15 @@ write_unbound_conf() {
         else
             do_ip6_line="no"
         fi
-        # 注意：本 heredoc 内容均为字面量（不含 $ 与反引号），
-        # 去掉引号仅为了让 $do_ip6_line 展开。
+    # 注意：本 heredoc 内容均为字面量（不含 $ 与反引号），
+    # 去掉引号仅为了让 $do_ip6_line / $CACHE_MIN_TTL / $LOGFILE_LINES 展开。
+        if [ "${LOGFILE_OK:-0}" -eq 1 ]; then
+            LOGFILE_LINES='    logfile: "/var/log/unbound.log"
+    log-time-ascii: yes
+    use-syslog: no'
+        else
+            LOGFILE_LINES='    use-syslog: no'
+        fi
         cat <<CONF
 server:
     interface: 127.0.0.1
@@ -340,7 +377,7 @@ server:
     hide-identity: yes
     hide-version: yes
     prefetch: yes
-    cache-min-ttl: 3600
+    cache-min-ttl: $CACHE_MIN_TTL
     cache-max-ttl: 86400
     msg-cache-size: 16m
     msg-cache-slabs: 8
@@ -349,6 +386,12 @@ server:
     outgoing-num-tcp: 8
     infra-cache-min-rtt: 50
     infra-cache-max-rtt: 1000
+    # 日志：断线时没有任何证据可查是这类脚本的头号痛点。
+    # 只写 warning 级别，避免流量大时把磁盘写满。
+    verbosity: 0
+$LOGFILE_LINES
+    # 强化：拒绝无效域名与私有地址回显，降低被当成开放解析器的滥用风险。
+    do-not-query-localhost: yes
 
 forward-zone:
     name: "."
@@ -577,6 +620,99 @@ HOOK
         changed=1
     fi
 
+    # --- NetworkManager：自行编写 resolv.conf 时会绕过 /etc/resolv.conf ---
+    # 必须用 drop-in 把 dns 设为 none，否则 NM 会把 DHCP 下发的 DNS 写回去。
+    nm_dir="/etc/NetworkManager/conf.d"
+    if [ -d /etc/NetworkManager ] || [ -d "$nm_dir" ]; then
+        if mkdir -p "$nm_dir" 2>/dev/null; then
+            if [ "$DRY_RUN" -eq 1 ]; then
+                info "[dry-run] 将写入 $nm_dir/99-dns-setup.conf（dns=none）"
+            else
+                if cat > "$nm_dir/99-dns-setup.conf" <<NMCONF
+# DNS-SETUP-MANAGED
+[main]
+dns=none
+rc-manager=unmanaged
+NMCONF
+                then
+                    ok "已配置 NetworkManager 不接管 DNS。"
+                    changed=1
+                    if command -v nmcli >/dev/null 2>&1; then
+                        systemctl reload NetworkManager >/dev/null 2>&1 ||
+                            systemctl restart NetworkManager >/dev/null 2>&1 || true
+                    fi
+                else
+                    warn "无法写入 $nm_dir/99-dns-setup.conf。"
+                fi
+            fi
+        fi
+    fi
+
+    # --- systemd-networkd：可能自带 static resolv.conf 生成 ---
+    # 创建 drop-in 关闭 DNS 下发，保留 DHCP 本身工作。
+    nd_dir="/etc/systemd/network"
+    if [ "$INIT" = "systemd" ] &&
+        (systemctl list-unit-files 2>/dev/null | grep -q 'systemd-networkd.service'); then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            info "[dry-run] 将为 systemd-networkd 写入 drop-in（UseDNS=no）"
+        else
+            nd_changed=0
+            for f in "$nd_dir"/*.network; do
+                [ -f "$f" ] || continue
+                if grep -q 'DNS-SETUP-MANAGED' "$f" 2>/dev/null; then
+                    nd_changed=1
+                    continue
+                fi
+                base=$(basename "$f")
+                drop="$nd_dir/$base.d"
+                if mkdir -p "$drop" 2>/dev/null && cat > "$drop/99-dns-setup.conf" <<'NDCONF'
+# DNS-SETUP-MANAGED
+[Network]
+UseDNS=no
+NDCONF
+                then
+                    nd_changed=1
+                fi
+            done
+            if [ "$nd_changed" -eq 1 ]; then
+                ok "已配置 systemd-networkd 不接管 DNS。"
+                changed=1
+                systemctl restart systemd-networkd >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+
+    # --- openresolv / resolvconf：Debian/Alpine 上常见的 resolv.conf 代理 ---
+    # 它们会在网络事件时重建 resolv.conf，必须把本机 unbound 告知它。
+    rc_conf="/etc/resolvconf.conf"
+    if command -v resolvconf >/dev/null 2>&1 || [ -d /etc/resolvconf ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            info "[dry-run] 将写入 $rc_conf（name_servers=127.0.0.1）"
+        else
+            if [ -f "$rc_conf" ] && grep -q 'DNS-SETUP-MANAGED' "$rc_conf" 2>/dev/null; then
+                ok "resolvconf 已受保护。"
+                changed=1
+            else
+                mkdir -p /etc 2>/dev/null || true
+                if {
+                    [ -s "$rc_conf" ] &&
+                        [ -n "$(tail -c 1 "$rc_conf" 2>/dev/null)" ] &&
+                        printf '
+' >> "$rc_conf"
+                    cat >> "$rc_conf" <<RCCONF
+# DNS-SETUP-MANAGED
+name_servers="127.0.0.1"
+RCCONF
+                } 2>/dev/null; then
+                    ok "已配置 resolvconf 指向本机 unbound。"
+                    changed=1
+                else
+                    warn "无法写入 $rc_conf。"
+                fi
+            fi
+        fi
+    fi
+
     [ "$changed" -eq 0 ] &&
         warn "没有发现可修改的 DHCP/DNS 管理器，仅完成 resolv.conf 写入。"
 }
@@ -611,6 +747,45 @@ restore_dhcp_guards() {
             info "已还原 udhcpc default.script。"
         else
             warn "还原 udhcpc default.script 失败（备份保留：$udhcpc_bak）。"
+        fi
+    fi
+
+    # NetworkManager drop-in
+    nm_conf="/etc/NetworkManager/conf.d/99-dns-setup.conf"
+    if [ -f "$nm_conf" ] && grep -q 'DNS-SETUP-MANAGED' "$nm_conf" 2>/dev/null; then
+        rm -f "$nm_conf" 2>/dev/null && info "已移除 NetworkManager DNS 保护。"
+        systemctl reload NetworkManager >/dev/null 2>&1 || true
+    fi
+
+    # systemd-networkd drop-in（只读本脚本写入的那个文件名）
+    for d in /etc/systemd/network/*.network.d; do
+        [ -d "$d" ] || continue
+        f="$d/99-dns-setup.conf"
+        if [ -f "$f" ] && grep -q 'DNS-SETUP-MANAGED' "$f" 2>/dev/null; then
+            rm -f "$f" 2>/dev/null
+            rmdir "$d" 2>/dev/null || true
+            info "已移除 systemd-networkd DNS 保护。"
+        fi
+    done
+
+    # resolvconf.conf 是追加式，必须精确删除标记段而不是删整个文件
+    rc_conf="/etc/resolvconf.conf"
+    if [ -f "$rc_conf" ] && grep -q 'DNS-SETUP-MANAGED' "$rc_conf" 2>/dev/null; then
+        tmp_rc="${rc_conf}.tmp.$$"
+        awk '
+            /^# DNS-SETUP-MANAGED$/ { skip = 1; next }
+            skip == 1 && /^name_servers="127\.0\.0\.1"$/ { skip = 2; next }
+            skip == 2 && /^$/ { skip = 0; next }
+            skip == 2 { skip = 0 }
+            { print }
+        ' "$rc_conf" > "$tmp_rc" 2>/dev/null
+        if [ -f "$tmp_rc" ]; then
+            if [ -s "$tmp_rc" ]; then
+                mv "$tmp_rc" "$rc_conf" 2>/dev/null && info "已移除 resolvconf DNS 保护。"
+            else
+                rm -f "$rc_conf" "$tmp_rc" 2>/dev/null
+                info "已移除 resolvconf 配置文件。"
+            fi
         fi
     fi
 
