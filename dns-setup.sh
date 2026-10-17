@@ -1,11 +1,11 @@
 #!/bin/sh
 # dns-setup.sh - 通用 DNS 配置工具
-# 版本：2.4.0
+# 版本：2.4.1
 # 自动从 AKDNS 官方脚本读取节点；每个节点测速 2 次（节点间并发）
 # 支持 Alpine/openrc、Debian/Ubuntu/systemd，防止 DHCP 覆盖 resolv.conf
 # v2.2.0 新增：验证失败自动回滚、手动输入 IPv4 校验、并发测速、unbound.conf 一并还原
 
-VERSION="2.4.0"
+VERSION="2.4.1"
 AKDNS_URL="https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh"
 UNBOUND_CONF="/etc/unbound/unbound.conf"
 BACKUP_DIR="/var/lib/dns-setup/backup"
@@ -38,7 +38,7 @@ ok() { printf "${G}[成功]${N} %s\n" "$*"; }
 info() { printf "${C}[信息]${N} %s\n" "$*"; }
 warn() { printf "${Y}[警告]${N} %s\n" "$*"; }
 err() { printf "${R}[错误]${N} %s\n" "$*"; }
-pause() { printf "\n按回车键返回菜单..."; read _dummy; }
+pause() { printf "\n按回车键返回菜单..."; read -r _dummy; }
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -50,7 +50,7 @@ require_root() {
 ask_yes() {
     # 返回 0=确认，1=拒绝。stdin 结束（EOF）时默认拒绝，
     # 避免在管道/无人值守场景下静默应用配置。
-    if ! read answer; then
+    if ! read -r answer; then
         answer="n"
     fi
     case "$answer" in
@@ -133,13 +133,22 @@ fetch_by_ip() {
     [ -n "$ip" ] || return 1
     mkdir -p "$(dirname "$RAW_IP_CACHE")" 2>/dev/null || true
     printf '%s\n' "$ip" > "$RAW_IP_CACHE" 2>/dev/null || true
+    path=${url#https://$host}
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --connect-timeout 8 --resolve "$host:443:$ip" "$url" -o "$output"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q --timeout=10 --header="Host: $host" -O "$output" "https://$ip/${url#https://$host}"
-    else
-        return 1
+        curl -fsSL --connect-timeout 8 --resolve "$host:443:$ip" "$url" -o "$output"             && [ -s "$output" ] && return 0
     fi
+    if command -v wget >/dev/null 2>&1; then
+        # 直连 IP 时证书 CN 与 IP 不匹配，不加 --no-check-certificate
+        # 必然 SSL 验证失败（实测 wget rc=5，且会留下 0 字节文件），
+        # 这样这个兜底分支就是死代码，DNS 已断的机器永远救不回来。
+        # 安全上可接受：URL 是我们写死的 GitHub raw，且已用 Host 头指定
+        # 目标主机，随后还会校验下载内容是否含 DNS_LIST。
+        wget -q --timeout=15 --no-check-certificate \
+            --header="Host: $host" -O "$output" \
+            "https://$ip$path" 2>/dev/null             && [ -s "$output" ] && return 0
+    fi
+    rm -f "$output" 2>/dev/null || true
+    return 1
 }
 
 download_text() {
@@ -408,9 +417,9 @@ server:
     outgoing-num-tcp: 8
     infra-cache-min-rtt: 50
     infra-cache-max-rtt: 1000
-    # 日志：断线时没有任何证据可查是这类脚本的头号痛点。
-    # 只写 warning 级别，避免流量大时把磁盘写满。
-    verbosity: 0
+    # 日志：verbosity 0 只记错误，日常几乎无输出，断线时拿不到线索；
+    # 1 为运行信息级，足够排查且不会像 2+ 那样刷爆磁盘。
+    verbosity: 1
 $LOGFILE_LINES
     # 强化：拒绝无效域名与私有地址回显，降低被当成开放解析器的滥用风险。
     do-not-query-localhost: yes
@@ -974,9 +983,12 @@ verify_dns() {
         http=$(curl -4 -sL --connect-timeout 8 -o /dev/null \
             -w '%{http_code}' \
             https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh 2>/dev/null)
-        [ "$http" = "200" ] &&
-            ok "GitHub raw 访问成功：HTTP $http" ||
+        # 不要写成 A && B || C：B 自身返回非 0 时 C 也会执行。
+        if [ "$http" = "200" ]; then
+            ok "GitHub raw 访问成功：HTTP $http"
+        else
             warn "GitHub raw 返回：HTTP $http"
+        fi
     fi
 }
 
@@ -1041,7 +1053,7 @@ auto_configure() {
 
 manual_configure() {
     printf "\n请输入 DNS 地址（可输入多个 IPv4，以空格分隔）：\n> "
-    read manual_servers
+    read -r manual_servers
     [ -n "$manual_servers" ] || {
         warn "未输入 DNS，已取消。"
         return 0
@@ -1055,7 +1067,7 @@ manual_configure() {
     done
 
     printf "是否强制上游使用 TCP？[y/N] "
-    if read force_tcp; then
+    if read -r force_tcp; then
         :
     else
         force_tcp="n"
@@ -1243,7 +1255,7 @@ menu() {
         printf "  4) 还原上一次备份的 DNS\n"
         printf "  0) 退出\n\n"
         printf "请选择 [0-4]："
-        read choice || {
+        read -r choice || {
             printf "\n输入结束，已退出。\n"
             return 0
         }

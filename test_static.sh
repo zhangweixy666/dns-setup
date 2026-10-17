@@ -45,8 +45,8 @@ grepn() {
 
 printf '\n=== 1. 静态检查 ===\n'
 chk "sh -n 语法通过" sh -n "$S"
-grepq "版本号为 2.4.0" 'VERSION="2.4.0"'
-grepq "头注释版本一致" '# 版本：2.4.0'
+grepq "版本号为 2.4.1" 'VERSION="2.4.1"'
+grepq "头注释版本一致" '# 版本：2.4.1'
 if [ "$(grep -c $'\xef\xbf\xbd' "$S")" = "0" ]; then
     PASS=$((PASS+1)); printf '  [PASS] %s\n' "无 U+FFFD 乱码"
 else
@@ -175,6 +175,29 @@ printf '\n=== 20. resolv.conf 保留 search ===\n'
 grepq "提取 search/domain" 'search_lines='
 grepq "写回 search" '"$search_lines"'
 grepq "超时兜底 options" 'options timeout:1 attempts:2'
+
+printf '\n=== 21. wget 兜底非死代码 ===\n'
+grepq "wget 忽略证书" 'no-check-certificate'
+grepq "wget 校验非空" '\[ -s "\$output" \] && return 0'
+grepq "curl 分支校验非空" 'curl -fsSL.*return 0'
+grepq "失败时清理空文件" 'rm -f "\$output"'
+
+printf '\n=== 22. 显式 if 代替 A&&B||C ===\n'
+if grep -q '\[ "\$http" = "200" \] &&' "$S"; then
+    FAIL=$((FAIL+1)); printf '  [FAIL] %s\n' '仍存在 A&&B||C 写法'
+else
+    PASS=$((PASS+1)); printf '  [PASS] %s\n' '已改为显式 if'
+fi
+
+printf '\n=== 23. read 均带 -r ===\n'
+nr=$(grep -c 'read ' "$S")
+nrr=$(grep -c 'read -r ' "$S")
+bare=$(grep -n 'read ' "$S" | grep -v 'read -r' | grep -v '#' | wc -l)
+if [ "$bare" = "0" ]; then
+    PASS=$((PASS+1)); printf '  [PASS] %s\n' '所有 read 均带 -r'
+else
+    FAIL=$((FAIL+1)); printf '  [FAIL] %s（%d 处未带）\n' '存在未带 -r 的 read' "$bare"
+fi
 
 printf '\n----------------------------------------\n'
 printf 'PASS=%d  FAIL=%d\n' "$PASS" "$FAIL"
