@@ -1,9 +1,18 @@
 #!/bin/sh
+# 自动定位待测脚本：优先参数，次选脚本所在目录的上一级。
+# 这样任何人 clone 下来都能直接跑，不依赖作者机器上的绝对路径。
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO=$(cd "$HERE/.." && pwd)
+
+S="${1:-$REPO/dns-setup.sh}"
+if [ ! -f "$S" ]; then
+    echo "找不到待测脚本：$S" >&2
+    exit 2
+fi
+
 # 回归测试：验证 v2.3.0 的 P0 修复是否真的生效
 # 重点：每个断言都要能「在旧版上失败、在新版上通过」
 
-S="$1"
-[ -n "$S" ] || S=/root/dns-work/dns-setup.sh
 PASS=0
 FAIL=0
 

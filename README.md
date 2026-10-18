@@ -299,6 +299,35 @@ chattr +i /etc/resolv.conf
 | `/var/lib/dns-setup/backup/` | DNS 配置备份 |
 | `/usr/share/udhcpc/default.script.dns-setup-bak` | Alpine udhcpc 原始脚本备份 |
 
+## 🧪 测试
+
+仓库附带五套测试（共 144 项断言），全部在仓库根的 `test/` 目录下，
+已做自动路径定位，clone 后可直接运行，不依赖任何绝对路径：
+
+```sh
+sh test/run.sh
+```
+
+指定其他待测脚本：
+
+```sh
+sh test/run.sh /path/to/dns-setup.sh
+```
+
+各套件单独运行（同样支持传路径）：
+
+```txt
+test/test_static.sh      82 项  静态断言（版本一致性、关键特征、配置项位置）
+test/test_behavior.sh    49 项  沙箱行为（提取函数单独跑，不碰真实系统）
+test/test_e2e.sh          3 项  故障注入（伪造 checkconf 失败，验证生产配置不被污染）
+test/test_uninstall.sh    5 项  卸载沙箱（备份筛选、保留策略、回退优先级）
+test/test_dnsdown.sh      5 项  DNS 全断自救（IP 直连取数 + 失败后不留残留）
+```
+
+> 注：`test_dnsdown.sh` 会真实访问 GitHub raw，无网络环境会失败，属预期。
+
+`test/` 目录不参与脚本运行，不影响部署。
+
 ## 🔍 常用排障
 
 查看系统 DNS：

@@ -1,7 +1,16 @@
 #!/bin/sh
+# 自动定位待测脚本：优先参数，次选脚本所在目录的上一级。
+# 这样任何人 clone 下来都能直接跑，不依赖作者机器上的绝对路径。
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO=$(cd "$HERE/.." && pwd)
+
+S="${1:-$REPO/dns-setup.sh}"
+if [ ! -f "$S" ]; then
+    echo "找不到待测脚本：$S" >&2
+    exit 2
+fi
+
 # 行为测试：在沙箱里提取函数单独运行，不碰真实系统文件
-S="$1"
-[ -n "$S" ] || S=/root/dns-work/dns-setup.sh
 W=$(mktemp -d /tmp/dnsbeh.XXXXXX)
 PASS=0; FAIL=0
 
