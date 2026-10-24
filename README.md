@@ -1,482 +1,425 @@
-# DNS 修改
+<div align="center">
 
-VPS 通用 DNS 自动配置与管理脚本
+<h1>🛡 DNS Setup</h1>
 
-适用于 Alpine、Debian/Ubuntu 等 Linux VPS，以及使用 DHCP 网络的 Incus/LXC 容器。
+<p><b>VPS 通用 DNS 自动配置与管理脚本</b></p>
 
-脚本会下载 AKDNS 官方脚本，动态读取当前 DNS 节点列表，分别测试 UDP/TCP 连通性和延迟，然后选择可用的最快 DNS。UDP 不可用时自动切换 TCP，并通过本地 unbound 转发，避免 Alpine/musl 对 `options use-vc` 支持不可靠的问题。
+<p>自动测速 · UDP/TCP 智能切换 · DHCP 防覆盖 · 一键回滚</p>
 
-README 中的命令均按“一个代码块一个命令”排列，便于直接复制执行。
+[![Version](https://img.shields.io/badge/version-v2.4.1-2ea44f?style=for-the-badge)](https://github.com/zhangweixy666/dns-setup)
+[![Platform](https://img.shields.io/badge/platform-Alpine%20%7C%20Debian%20%7C%20Ubuntu-0078d7?style=for-the-badge)](#-系统要求)
+[![Init](https://img.shields.io/badge/init-OpenRC%20%7C%20systemd-orange?style=for-the-badge)](#-系统要求)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey?style=for-the-badge)](#-致谢与许可)
 
-## ✨ 项目简介
+<p><b>DNS 断了也能自救 · 改坏了能一键还原</b></p>
 
-这是一个面向 VPS 和容器环境的 DNS 修改工具，重点解决以下问题：
+[🚀 快速开始](#-快速开始)　·　[🎯 解决什么问题](#-解决什么问题)　·　[✨ 核心特性](#-核心特性)　·　[❓ 常见问题](#-常见问题)　·　[📜 更新记录](#-更新记录)
 
-- VPS 出站 UDP/53 被限制，但 TCP/53 可用。
-- AKDNS 节点需要先通过官方脚本测速，不能使用固定结果。
-- Alpine/musl 下 `options use-vc` 不能稳定强制系统解析器走 TCP。
-- Incus/LXC 的 DHCP 续租会把下发的 DNS 写回 `/etc/resolv.conf`。
-- `udhcpc`、`dhcpcd`、`systemd-resolved` 等组件可能覆盖手动 DNS 配置。
-- 修改 DNS 后需要保留备份，并能随时还原。
+</div>
 
-## 🧩 功能概览
+---
 
-| 功能 | 说明 |
-|------|------|
-| AKDNS 动态测速 | 下载 AKDNS 官方脚本并读取其中的 `DNS_LIST`；本机 DNS 已断时用公共解析器直连兜底 |
-| 多上游兜底 | 除最快节点外，额外写入最多 3 个可用备用上游，避免单点下线导致整机 DNS 中断 |
-| UDP/TCP 检测 | 每个节点分别测试 UDP 和 TCP，每种协议测试 2 次 |
-| 智能协议选择 | UDP 有可用节点时优先选择最快 UDP；UDP 全部失败时选择最快 TCP |
-| TCP 转发 | 通过 unbound 的 `forward-tcp-upstream: yes` 强制连接上游 TCP/53 |
-| 自定义 DNS | 支持手动输入 IPv4 / IPv6 DNS 服务商地址 |
-| DHCP 防覆盖 | 处理 `chattr`、Alpine `udhcpc`、`dhcpcd` 等常见覆盖来源 |
-| 本地 DNS 入口 | 系统统一使用 `127.0.0.1:53`，由 unbound 负责转发 |
-| 自动备份 | 修改前备份 `/etc/resolv.conf` 和 unbound 配置 |
-| 一键还原 | 按时间戳配对还原 resolv.conf 与 unbound 配置，跳过空备份，还原后实测解析 |
-| 失败回滚 | 验证不通过时回滚本次改动（含 resolv.conf 与 immutable 属性） |
-| 中文界面 | 菜单、状态和错误提示均为中文 |
-| 开机自启 | 自动加入 Alpine OpenRC 或 systemd 启动流程 |
+## 🎯 解决什么问题
 
-## ⚡ 快速开始
+手动改 DNS，翻车的方式就那么几种：
 
-下载脚本：
+| 你遇到的坑 | 这个脚本怎么处理 |
+|:---|:---|
+| VPS 出站 UDP/53 被限制，但 TCP/53 可用 | 每个节点分别测 UDP 和 TCP，UDP 全挂自动切 TCP，由 unbound 强制 `forward-tcp-upstream` |
+| Alpine/musl 下 `options use-vc` 不能稳定强制 TCP | 不依赖系统解析器，统一走本地 unbound 转发 |
+| Incus/LXC 的 DHCP 续租把手改的 DNS 写回去 | 6 层防覆盖：immutable 属性 + udhcpc 插桩 + dhcpcd 钩子 + systemd-resolved + NM + networkd |
+| DNS 已经断了，脚本却下载不下来节点列表 | 公共解析器取 IP + IP 直连兜底 + 节点列表缓存降级 |
+| 改完不生效，只能重装系统或者重建容器 | `--dry-run` 预演、`--restore` 还原、`--uninstall` 干净卸载 |
+| 中途 Ctrl+C，机器停在一半新一半旧的状态 | 临时文件 → 校验 → `mv` 原子替换 + `trap` 中断回滚 |
 
-```sh
-wget -qO /root/dns-setup.sh https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-setup.sh
-```
+> 💡 **一句话**：它不只是「把 DNS 改快」，而是保证「改不坏，坏了能退」。
 
-赋予执行权限：
+---
 
-```sh
-chmod +x /root/dns-setup.sh
-```
+## 🚀 快速开始
 
-启动中文交互菜单：
-
-```sh
-sh /root/dns-setup.sh
-```
-
-直接执行自动测速并应用：
+### 一键自动测速并应用
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-setup.sh | sh -s -- --auto
 ```
 
-## 🖥️ 菜单说明
+### 下载后运行（推荐）
+
+```sh
+wget -qO /root/dns-setup.sh https://raw.githubusercontent.com/zhangweixy666/dns-setup/main/dns-setup.sh
+```
+
+```sh
+chmod +x /root/dns-setup.sh
+```
+
+```sh
+sh /root/dns-setup.sh
+```
+
+### 先看看它会做什么（不改任何文件）
+
+```sh
+sh /root/dns-setup.sh --dry-run
+```
+
+---
+
+## 📖 目录
+
+- [🎯 解决什么问题](#-解决什么问题)
+- [🚀 快速开始](#-快速开始)
+- [✨ 核心特性](#-核心特性)
+  - [智能测速与协议选择](#-智能测速与协议选择)
+  - [六层 DHCP 防覆盖](#-六层-dhcp-防覆盖)
+  - [失败原子性](#-失败原子性)
+  - [运维闭环](#-运维闭环)
+- [🏗 工作原理](#-工作原理)
+- [🖥 菜单与命令行](#-菜单与命令行)
+- [🔧 可调参数](#-可调参数)
+- [📂 配置与备份位置](#-配置与备份位置)
+- [🧩 系统要求](#-系统要求)
+- [🧪 测试](#-测试)
+- [❓ 常见问题](#-常见问题)
+- [📜 更新记录](#-更新记录)
+- [🙏 致谢与许可](#-致谢与许可)
+
+---
+
+## ✨ 核心特性
+
+### 🔍 智能测速与协议选择
+
+- 下载 AKDNS **官方脚本**并解析其中的 `DNS_LIST`，**不使用任何写死的节点列表**
+- 每个节点 **UDP 测 2 次 + TCP 测 2 次**，按真实延迟排序
+- UDP 有可用节点 → 选最快 UDP；UDP 全挂 → 选最快 TCP
+- 写入 **最快节点 + 最多 3 个备用上游**，单点下线不会导致整机 DNS 中断
+- 每节点每协议采样次数可调（`SCAN_COUNT`），繁忙 VPS 可加大采样降低误判
+
+```text
+下载 AKDNS 官方脚本
+    ↓
+读取官方 DNS_LIST（失败则用上次缓存）
+    ↓
+每节点 UDP ×2 / TCP ×2
+    ↓
+UDP 可用 → 最快 UDP   ·   UDP 全挂 → 最快 TCP
+    ↓
+生成 unbound 配置（最快 + 3 备用）
+    ↓
+/etc/resolv.conf → 127.0.0.1
+    ↓
+部署 DHCP 防覆盖
+    ↓
+实测解析 + GitHub 访问验证
+```
+
+### 🛡 六层 DHCP 防覆盖
+
+改完 DNS 过一会儿又变回去，通常是这些组件在动手：
+
+| # | 覆盖来源 | 处理方式 |
+|:---:|:---|:---|
+| 1 | 直接覆写文件 | `/etc/resolv.conf` 写入 `nameserver 127.0.0.1`，尝试 `chattr +i` |
+| 2 | Alpine `udhcpc` | 在 `/usr/share/udhcpc/default.script` 的 `resolv_conf()` 插入托管标记判断 |
+| 3 | `dhcpcd` | 写入官方保证加载的 `/etc/dhcpcd.enter-hook`（**只追加，不 truncate**） |
+| 4 | `systemd-resolved` | 停用服务并移除开机自启 |
+| 5 | NetworkManager | `conf.d/99-dns-setup.conf`：`dns=none` + `rc-manager=unmanaged` |
+| 6 | systemd-networkd / openresolv | `*.network.d/*.conf` → `UseDNS=no`；`resolvconf.conf` → `name_servers="127.0.0.1"` |
+
+> ⚠️ 容器缺少 `CAP_LINUX_IMMUTABLE` 时，`chattr +i` 会返回 0 但**实际不生效**。脚本用 `lsattr` 复核，并在输出中如实告知最终生效的是哪几层保护。
+
+### 🔒 失败原子性
+
+系统级 DNS 改动的可怕之处不是「当场报错」，而是「当下看着正常、重启才炸」。本项目为此做了四件事：
+
+- **配置原子写入**：临时文件 → `unbound-checkconf` 校验 → `mv` 原子替换。校验失败，生产配置分毫不动
+- **符号链接先拆**：Debian 上 `/etc/resolv.conf` 常是 systemd-resolved 的软链，`>` 会穿透写入 tmpfs，重启全丢。脚本先 `readlink` 记录再替换为实体文件
+- **共享文件只追加**：`dhcpcd.enter-hook`、`resolvconf.conf` 等系统级共享入口一律 `>>` + `BEGIN/END` 标记，绝不 `cat >`
+- **回滚与改动对称**：`save_pre_state` / `rollback_changes` / `restore_dhcp_guards` 三件套，文件内容、`chattr` 属性、新增标记、drop-in、追加段、被停用服务**全部还原**；`trap 'on_interrupt' INT TERM` 覆盖 Ctrl+C 与 SSH 断连
+
+### 🧰 运维闭环
+
+| 能力 | 命令 | 说明 |
+|:---|:---|:---|
+| 预演 | `--dry-run` | 只打印将写入的配置与保护动作，**不修改任何文件**（副作用探测也不真做） |
+| 还原 | `--restore` | 按文件名时间戳**配对**还原 resolv.conf 与 unbound 配置，跳过 0 字节备份，还原后实测解析 |
+| 卸载 | `--uninstall` | 逆序撤销全部改动：备份 → 原符号链接 → 公共 DNS 三级回退，重新启用 systemd-resolved |
+| 无人值守 | `--yes` | 跳过装包确认（脚本装包前**默认必须确认**） |
+| 备份保留 | `BACKUP_KEEP` | 默认保留最近 10 份，按严格时间戳排序，不无限占盘 |
+
+---
+
+## 🏗 工作原理
+
+系统不会直接把 AKDNS 地址写进 `/etc/resolv.conf`，而是用本地 unbound 做一个**永远不变的入口**：
+
+**UDP 正常时**
+
+```text
+系统程序
+  → 127.0.0.1:53
+  → unbound
+  → 上游 DNS :53/UDP
+```
+
+**UDP 被限制时**
+
+```text
+系统程序
+  → 127.0.0.1:53
+  → unbound  (forward-tcp-upstream: yes)
+  → 上游 DNS :53/TCP
+```
+
+> 📌 所以 `dig @127.0.0.1` 显示本地走 UDP，**不代表**上游走 UDP —— 真正的上游连接协议由 unbound 决定。
+
+**DHCP 典型覆盖链（以 Incus Alpine 容器为例）**
+
+```text
+eth0 配置为 DHCP
+    ↓
+udhcpc 常驻
+    ↓
+续约 / 重新绑定
+    ↓
+/usr/share/udhcpc/default.script → resolv_conf()
+    ↓
+DHCP 下发的 nameserver 覆盖 /etc/resolv.conf
+```
+
+脚本正是在最后一步之前插入托管判断，把这条链掐断。
+
+---
+
+## 🖥 菜单与命令行
+
+### 交互菜单
 
 ```text
 ========================================
        通用 DNS 配置工具 v2.4.1
 ========================================
 系统：Alpine Linux（openrc）
-
   1) 下载 AKDNS 官方脚本并自动测速配置
   2) 手动输入 DNS 服务商地址
   3) 查看当前 DNS 状态
   4) 还原上一次备份的 DNS
   0) 退出
-
 请选择 [0-4]：
 ```
 
-### 1. 下载 AKDNS 官方脚本并自动测速配置
+### 命令行参数
 
-执行流程：
+| 参数 | 作用 |
+|:---|:---|
+| `--auto` | 自动测速并应用 |
+| `--status` | 查看当前 DNS 状态（resolv.conf、unbound、上游、托管标记、immutable、解析实测） |
+| `--restore` | 还原最近一次备份 |
+| `--dry-run` | 预演，只打印不落盘 |
+| `--yes` / `-y` | 跳过依赖安装确认 |
+| `--uninstall` | 一键卸载并恢复原始 DNS |
 
-```text
-下载 AKDNS 官方脚本
-    ↓
-读取官方 DNS_LIST
-    ↓
-每个节点测试 UDP 2 次、TCP 2 次
-    ↓
-UDP 可用：选择最快 UDP
-UDP 全部不可用：选择最快 TCP
-    ↓
-生成 unbound 配置
-    ↓
-将 /etc/resolv.conf 指向 127.0.0.1
-    ↓
-部署 DHCP 防覆盖
-    ↓
-验证 DNS 解析和 GitHub 访问
-```
+---
 
-该模式不会使用本项目中写死的 AKDNS 节点列表。每次运行都会重新下载官方脚本并读取最新节点。
+## 🔧 可调参数
 
-### 2. 手动输入 DNS 服务商地址
-
-支持一个或多个 IPv4 地址，例如：
-
-```text
-8.8.8.8 8.8.4.4
-```
-
-```text
-1.1.1.1 1.0.0.1
-```
-
-```text
-45.76.71.83
-```
-
-输入后可以选择是否强制上游使用 TCP。
-
-如果 VPS 的 UDP/53 不通，应选择强制 TCP；如果 UDP/53 正常，可以使用默认 UDP 转发。
-
-### 3. 查看当前 DNS 状态
-
-显示以下信息：
-
-- 当前系统发行版和 init 系统。
-- `/etc/resolv.conf` 内容。
-- unbound 服务状态。
-- 当前上游 DNS 和转发协议。
-- DHCP 托管标记。
-- `/etc/resolv.conf` 的 immutable 属性。
-- 测试域名的解析结果。
-
-### 4. 还原上一次备份的 DNS
-
-还原最近一次备份的 `/etc/resolv.conf` 和对应的 unbound 配置。
-
-如果备份中的 `resolv.conf` 仍指向本地 unbound（`127.0.0.1`），脚本会保持 unbound 运行、保留 DNS 托管标记并维持开机自启，避免还原后 DNS 中断；只有备份内容不依赖本地 unbound 时，才会停止 unbound 并移除开机自启。
-
-还原时还会：跳过 0 字节的无效备份；按文件名时间戳配对还原对应的 unbound 配置；还原完成后实测解析，若该备份对应的上游已失效会明确提示重新运行 `--auto`。
-
-备份目录：
-
-```text
-/var/lib/dns-setup/backup/
-```
-
-## 🔧 命令行参数
-
-自动测速并应用：
+全部通过环境变量覆盖，不改脚本：
 
 ```sh
-sh /root/dns-setup.sh --auto
+CACHE_MIN_TTL=60 sh /root/dns-setup.sh --auto
 ```
-
-查看当前状态：
 
 ```sh
-sh /root/dns-setup.sh --status
+SCAN_TIMEOUT=2 sh /root/dns-setup.sh --auto
 ```
-
-还原最近一次备份：
 
 ```sh
-sh /root/dns-setup.sh --restore
+SCAN_COUNT=5 sh /root/dns-setup.sh --auto
 ```
 
-预演模式（只打印将写入的配置，不修改任何文件）：
+| 变量 | 默认 | 什么时候改 |
+|:---|:---:|:---|
+| `CACHE_MIN_TTL` | `3600` | CDN 调度 / DDNS 场景调小（如 `60`），否则切 IP 要等一小时 |
+| `SCAN_TIMEOUT` | `1` | 繁忙 VPS 上 1 秒容易把好节点判死，调到 `2` |
+| `SCAN_COUNT` | `2` | 2 次取平均噪声偏大，建议 `5` |
+| `BACKUP_KEEP` | `10` | 备份保留份数 |
 
-```sh
-sh /root/dns-setup.sh --dry-run
-```
+---
 
-无人值守（跳过依赖安装确认）：
-
-```sh
-sh /root/dns-setup.sh --yes
-```
-
-一键卸载（恢复原始 resolv.conf、撤销全部 DHCP 保护、停用 unbound）：
-
-```sh
-sh /root/dns-setup.sh --uninstall
-```
-
-可调参数（环境变量，按需覆盖）：
-
-```sh
-CACHE_MIN_TTL=60 sh /root/dns-setup.sh --auto   # 强制最小缓存 60 秒（CDN 调度/DDNS 场景）
-SCAN_TIMEOUT=2 sh /root/dns-setup.sh --auto     # 单次探测超时 2 秒（繁忙 VPS）
-SCAN_COUNT=5 sh /root/dns-setup.sh --auto       # 每节点每协议采样 5 次（更稳）
-```
-
-## 🌐 DNS 转发原理
-
-系统不会直接把 AKDNS 地址写进 `/etc/resolv.conf`，而是使用本地 unbound 作为稳定入口：
-
-UDP 正常时：
-
-```text
-系统程序
-  → 127.0.0.1:53
-  → unbound
-  → 上游 DNS:53/UDP
-```
-
-UDP 不通时：
-
-```text
-系统程序
-  → 127.0.0.1:53
-  → unbound
-  → 上游 DNS:53/TCP
-```
-
-当测速判断需要 TCP 时，配置中会写入：
-
-```conf
-forward-tcp-upstream: yes
-```
-
-因此，`dig @127.0.0.1` 显示本地请求使用 UDP 不代表外部上游使用 UDP。真正的上游连接由 unbound 控制。
-
-## 🧱 DHCP 覆盖问题
-
-Incus Alpine 容器中的典型覆盖链路：
-
-```text
-eth0 配置为 DHCP
-        ↓
-udhcpc 常驻后台
-        ↓
-DHCP 续约或重新绑定
-        ↓
-调用 /usr/share/udhcpc/default.script
-        ↓
-执行 resolv_conf()
-        ↓
-DHCP 下发的 DNS 覆盖 /etc/resolv.conf
-```
-
-例如 DHCP 下发：
-
-```text
-nameserver 10.10.0.1
-```
-
-即使手动修改过 DNS，续租后也可能重新变成：
-
-```text
-nameserver 10.10.0.1
-```
-
-## 🛡️ 防覆盖机制
-
-脚本应用 DNS 后会执行以下保护：
-
-1. 将 `/etc/resolv.conf` 设置为：
-
-```text
-nameserver 127.0.0.1
-```
-
-2. 尝试执行：
-
-```sh
-chattr +i /etc/resolv.conf
-```
-
-防止 DHCP 客户端直接覆盖文件。
-
-3. Alpine 检测到 `/usr/share/udhcpc/default.script` 时：
-
-- 自动创建原始脚本备份。
-- 在 `resolv_conf()` 中加入托管标记判断。
-- DHCP 续租时跳过 DNS 覆写。
-
-4. 如果系统安装了 `dhcpcd`，添加保护钩子。
-
-5. 在 systemd 系统中停用 `systemd-resolved`，避免它重新接管 DNS。
-
-6. 将 unbound 加入开机启动。
-
-如果容器文件系统不支持 immutable 属性，脚本仍会使用 DHCP 脚本保护，并在输出中提示实际生效的保护方式。
-
-## 📂 配置和备份位置
+## 📂 配置与备份位置
 
 | 路径 | 作用 |
-|------|------|
-| `/etc/unbound/unbound.conf` | unbound 主配置 |
+|:---|:---|
+| `/etc/unbound/unbound.conf` | unbound 主配置（原子写入） |
 | `/etc/resolv.conf` | 系统 DNS 入口，通常为 `127.0.0.1` |
-| `/etc/dns-setup-managed` | DNS 已由脚本接管的标记 |
-| `/var/lib/dns-setup/backup/` | DNS 配置备份 |
+| `/etc/dns-setup-managed` | 「DNS 已由本脚本接管」的标记 |
+| `/var/lib/dns-setup/backup/` | DNS 配置备份（按 `YYYYMMDD-HHMMSS` 命名） |
 | `/usr/share/udhcpc/default.script.dns-setup-bak` | Alpine udhcpc 原始脚本备份 |
+| `/var/lib/dns-setup/nodes.cache` | 上次成功的节点列表（官方脚本改格式时降级用） |
+| `/var/log/unbound.log` | unbound 运行日志（`verbosity: 1`） |
+
+---
+
+## 🧩 系统要求
+
+| 项目 | 要求 |
+|:---|:---|
+| 系统 | Alpine Linux、Debian / Ubuntu，以及使用 DHCP 的 Incus / LXC 容器 |
+| init | OpenRC（Alpine）或 systemd（Debian/Ubuntu） |
+| 权限 | root |
+| 依赖 | `unbound`（脚本会先询问再安装）、`curl` 或 `wget`、`dig` |
+| 网络 | 自动模式需能访问 GitHub raw |
+
+---
 
 ## 🧪 测试
 
-仓库附带五套测试（共 144 项断言），全部在仓库根的 `test/` 目录下，
-已做自动路径定位，clone 后可直接运行，不依赖任何绝对路径：
+仓库自带 **5 套测试、共 144 项断言**，全部在 `test/` 下，自动定位路径，clone 后可直接运行：
 
 ```sh
 sh test/run.sh
 ```
 
-指定其他待测脚本：
-
 ```sh
 sh test/run.sh /path/to/dns-setup.sh
 ```
 
-各套件单独运行（同样支持传路径）：
+| 套件 | 项数 | 作用 |
+|:---|:---:|:---|
+| `test_static.sh` | 82 | 静态断言：版本一致性、关键特征存在、配置项位置 |
+| `test_behavior.sh` | 49 | 沙箱行为：提取函数单独跑，路径重定向到临时目录，不碰真实系统 |
+| `test_e2e.sh` | 3 | 故障注入：伪造 `checkconf` 失败，验证生产配置不被污染 |
+| `test_uninstall.sh` | 5 | 卸载沙箱：备份筛选、保留策略、回退优先级 |
+| `test_dnsdown.sh` | 5 | DNS 全断自救：IP 直连取数 + 失败后不留残留 |
 
-```txt
-test/test_static.sh      82 项  静态断言（版本一致性、关键特征、配置项位置）
-test/test_behavior.sh    49 项  沙箱行为（提取函数单独跑，不碰真实系统）
-test/test_e2e.sh          3 项  故障注入（伪造 checkconf 失败，验证生产配置不被污染）
-test/test_uninstall.sh    5 项  卸载沙箱（备份筛选、保留策略、回退优先级）
-test/test_dnsdown.sh      5 项  DNS 全断自救（IP 直连取数 + 失败后不留残留）
-```
+> 📌 `test_dnsdown.sh` 会真实访问 GitHub raw，无网络环境失败属预期。
+> `test/` 目录不参与脚本运行，不影响部署。
 
-> 注：`test_dnsdown.sh` 会真实访问 GitHub raw，无网络环境会失败，属预期。
+---
 
-`test/` 目录不参与脚本运行，不影响部署。
+## ❓ 常见问题
 
-## 🔍 常用排障
+<details>
+<summary><b>装完之后 `dig` 还是走 UDP，是不是没生效？</b></summary>
 
-查看系统 DNS：
+不是。`dig @127.0.0.1` 测的是「本机 → unbound」这一段，这一段永远是 UDP。真正决定上游走 UDP 还是 TCP 的是 unbound 的 `forward-tcp-upstream`。
 
-```sh
-cat /etc/resolv.conf
-```
-
-查看 unbound 状态：
+想验证上游协议，看 unbound 配置或日志：
 
 ```sh
-rc-service unbound status
+grep forward-tcp-upstream /etc/unbound/unbound.conf
 ```
 
-检查 unbound 配置：
+</details>
 
-```sh
-unbound-checkconf /etc/unbound/unbound.conf
-```
+<details>
+<summary><b>Alpine 容器里 `chattr +i` 没报错，但 DNS 还是被改了？</b></summary>
 
-测试本地 DNS：
+容器通常没有 `CAP_LINUX_IMMUTABLE`，`chattr +i` 会**返回 0 但不生效**。脚本用 `lsattr` 复核并会明确告知。这种情况下靠的是 udhcpc 插桩 + dhcpcd 钩子那几层，通常已经够用。
 
-```sh
-dig @127.0.0.1 www.google.com
-```
+</details>
 
-测试指定上游 TCP：
+<details>
+<summary><b>DNS 已经断了，脚本还能跑起来吗？</b></summary>
 
-```sh
-dig +tcp @45.76.71.83 www.google.com
-```
+能。这是本项目从 v2.2.2 起专门解决的问题：
 
-查看 DHCP 保护是否写入：
+1. 用公共解析器单独取 GitHub 的 IP
+2. 用 IP 直连下载（带 `Host` 头，`--no-check-certificate`）
+3. 下载后校验内容含 `DNS_LIST`
+4. 仍失败则用 `/var/lib/dns-setup/nodes.cache` 上次成功的列表
 
-```sh
-grep -n DNS-SETUP-MANAGED /usr/share/udhcpc/default.script
-```
+</details>
 
-查看当前 immutable 属性：
+<details>
+<summary><b>`--restore` 会把我现在的 DNS 弄断吗？</b></summary>
 
-```sh
-lsattr /etc/resolv.conf
-```
+不会。还原逻辑有三重保护：
 
-如果 DNS 仍然失败，先确认：
+- 跳过 0 字节的无效备份
+- 按同一时间戳**配对**还原 resolv.conf 与 unbound 配置（避免跨时间点错配）
+- 如果备份内容仍指向 `127.0.0.1`，会**保持 unbound 运行**并保留托管标记，而不是傻乎乎地停掉它
 
-- VPS 是否能访问 GitHub raw。
-- 上游 DNS 的 53 端口是否可达。
-- `unbound` 是否处于 started 状态。
-- `/etc/resolv.conf` 是否仍为 `127.0.0.1`。
-- 容器文件系统是否支持 `chattr +i`。
-- 上游 DNS 是否已经临时失效。
+还原完成后还会实测解析，若该备份的上游已失效会提示重跑 `--auto`。
 
-## ⚠️ 注意事项
+</details>
 
-- 需要 root 权限。
-- 自动模式依赖访问 GitHub raw 下载 AKDNS 官方脚本。
-- DNS 节点的可用性会随时间和网络环境变化，每次自动模式都会重新测速。
-- 脚本会修改 DNS 管理行为，建议操作前创建 VPS 或容器快照。
-- 还原前会自动保存当前配置。
-- 生产环境请先确认云厂商安全组和容器网络策略。
-- 本项目只负责 DNS 配置，不负责 AKDNS 控制台中的解锁授权。
-- 请在自己拥有或获授权管理的服务器上使用。
+<details>
+<summary><b>备份会不会把磁盘占满？</b></summary>
+
+不会。`BACKUP_KEEP` 默认保留最近 10 份，且备份列表只接受严格的 `YYYYMMDD-HHMMSS` 文件名。
+
+> 这一步是踩过坑的：`ls -1 | sort -r` 会把 `resolv.conf.unknown`、`resolv.conf.bak2` 也纳入排序，而字典序里非数字排在数字之后，倒排就抢到了头部 —— 于是「最新备份」变成垃圾文件，真正的备份反而被挤出保留窗口。
+
+</details>
+
+<details>
+<summary><b>`--dry-run` 真的什么都不改吗？</b></summary>
+
+真的。包括**副作用探测**也不做 —— 判断日志是否可写时只检查目录权限（`[ -w dir ]`），不会创建测试文件，保证打印内容与实际执行完全一致。
+
+</details>
+
+<details>
+<summary><b>会影响容器里其他服务吗？</b></summary>
+
+不会改动别人的配置。所有系统级共享文件（`dhcpcd.enter-hook`、`resolvconf.conf`）都只追加带标记的段落，卸载时用 `awk` 精确剥离自己写的那一段，其余内容原样保留。
+
+</details>
+
+<details>
+<summary><b>支持 IPv6 上游吗？</b></summary>
+
+支持。早期版本写死了 `do-ip6: no`，导致 IPv6 上游「能通过校验、能写进配置、但 unbound 根本不去连」，必然验证失败回滚。v2.3.0 起按上游地址族动态生成。
+
+</details>
+
+---
 
 ## 📜 更新记录
 
-### v2.4.1（2026-10-18）
+### v2.4.1 — 终审用 shellcheck 挖出死代码
 
-终审阶段深度检查发现的问题修复。本轮把 shellcheck 引入验证流程，找出了没有任何测试覆盖的死代码分支。
+- 🚨 **`fetch_by_ip` 的 wget 兜底从未工作过**：用 IP 直连 `https://$ip/` 时 TLS 证书 CN 是域名而非 IP，不加 `--no-check-certificate` 必然失败（实测 `wget rc=5`），还会留下 0 字节文件。这意味着「DNS 已断时自救」一直只对装了 curl 的机器有效。现加上忽略证书验证（URL 写死为 GitHub raw + `Host` 头指定 + 下载后校验内容含 `DNS_LIST`），并检查文件非空。实测 DNS 屏蔽状态下成功取回 78684 字节。
+- 🩹 `curl` 兜底分支也未校验非空，失败会留下空文件被当成成功；现在两条路径都校验 `[ -s "$output" ]`
+- 🩹 `verify_dns` 里 `[ ... ] && ok || warn` 不符合 if-then-else 语义（`ok` 返回非 0 会连带执行 `warn`），改显式 `if/else`
+- 🩹 5 处 `read` 未带 `-r`，其中 `read manual_servers` 直接影响用户输入的 DNS 地址
+- 🔧 `verbosity` 由 `0` 调到 `1`：`0` 只记错误，等于「配了日志但断线时依然查不到东西」
 
-- 修复（高危，死代码）：`fetch_by_ip` 的 wget 兜底分支从未真正工作过。用 IP 直连 `https://$ip/` 时，TLS 证书 CN 是域名而非 IP，不加 `--no-check-certificate` 必然 SSL 验证失败（实测 `wget rc=5`），且会留下一个 0 字节文件。这意味着**只有 wget 没有 curl 的机器，DNS 已断时仍然救不回来**——所谓「鸡生蛋」自救一直只对装了 curl 的机器有效。现在加上忽略证书验证（可接受：URL 写死为 GitHub raw，且已用 `Host` 头指定目标主机，下载后还会校验内容是否含 `DNS_LIST`），并在下载后检查文件非空，失败时清理残留。实测：DNS 屏蔽状态下成功取回 78684 字节且含 `DNS_LIST`。
-- 修复：`curl` 兜底分支未检查产出文件是否非空，失败时会留下空文件被当成成功。现在 `curl` 与 `wget` 两条路径都校验 `[ -s "$output" ]`。
-- 修复：`verify_dns` 里 `[ ... ] && ok || warn` 的写法不符合 if-then-else 语义（`ok` 若返回非 0 会连带执行 `warn`）。改为显式 `if/else`。
-- 修复：5 处 `read` 未带 `-r`，会吞掉反斜杠。其中 `read manual_servers` 直接影响用户手动输入的 DNS 地址。
-- 改进：`verbosity` 由 `0` 调到 `1`。`0` 只记录错误，日常几乎无输出，等于「配了日志但断线时依然查不到东西」；`1` 是运行信息级，足够排查且不像 `2+` 那样刷爆磁盘。
+<details>
+<summary><b>📚 历史版本（点击展开）</b></summary>
 
-### v2.4.0（2026-10-18）
+<br>
 
-补齐运维闭环：卸载、备份治理、降级容错、参数覆盖。（本项目不再发布 GitHub Release，版本以 tag 为准。）
+**v2.4.0** — 补齐运维闭环：新增 `--uninstall`（三级回退：有效备份 → 原符号链接 → 公共 DNS）、`--yes`、装包前确认、节点列表缓存降级、`BACKUP_KEEP` 保留策略、保留 `search`/`domain`、`options timeout:1 attempts:2`；修复备份列表接受任意文件名导致 `--restore` 可能还原到垃圾文件。
 
-- 新增：`--uninstall` 一键卸载。按优先级找最近一份**非空且不指向本机 unbound** 的备份恢复 `resolv.conf`；找不到则尝试恢复原符号链接；两者都无时写入公共 DNS 兜底避免直接断网。随后撤销 DHCP 保护、停 unbound 并删开机自启、重新启用被停用的 systemd-resolved、清理标记与缓存。备份目录默认保留不删。
-- 新增：`--yes` / `-y` 无人值守模式，跳过依赖安装确认。
-- 新增：`ensure_deps` 装包前必须确认。之前 `--auto` 会静默 `apk add` / `apt-get install`，在生产机上属于不可接受的副作用。
-- 新增：节点列表缓存降级。AKDNS 官方脚本改了格式（单引号 / 换行分隔 / 变量拼接）导致解析为空时，不再直接失败，改用 `/var/lib/dns-setup/nodes.cache` 上次成功的列表。
-- 新增：备份保留策略。`BACKUP_KEEP`（默认 10）按时间戳保留最近 N 份，防止无限累积占盘。
-- 新增：`resolv.conf` 保留 `search` / `domain` 域。云环境的主机名短名解析依赖它，之前会被直接冲掉。
-- 新增：`options timeout:1 attempts:2`。unbound 若意外挂掉，默认 5 秒 × 2 次会把每个请求卡 10 秒，现在最多 2 秒。
-- 修复（重要）：备份列表不再接受任意文件名。之前 `ls -1 | sort -r` 会把目录里任何 `resolv.conf.*` 文件纳入排序，而字典序里 `unknown` / `bak2` 排在数字之后，倒排时抢占头部——`--restore` 可能把非时间戳文件当成「最新备份」，保留策略也会把真正最新的备份挤出窗口。新增 `list_backups` 只接受 `YYYYMMDD-HHMMSS` 严格格式，并用 `grep -E '^[0-9]{8}-[0-9]{6}$'` 锚定（不用 `case` 定长模式，写错位数会静默全部不匹配）。
+**v2.3.1** — 补齐三条覆盖链（NetworkManager `dns=none`、systemd-networkd `UseDNS=no`、openresolv `name_servers`）并全部纳入回滚；新增 unbound 日志（自动 `chown`/`chmod`，失败降级为 syslog）；新增 `do-not-query-localhost`；新增三个可调环境变量。
 
-### v2.3.1（2026-10-18）
+**v2.3.0** — 聚焦失败原子性：配置改临时文件 + 校验 + `mv`；拆解 `resolv.conf` 符号链接；共享钩子改追加 + 标记段；新增 `save_pre_state`/`rollback_changes`/`restore_dhcp_guards` 完整回滚；新增 `trap` 中断保护；修复 `do-ip6` 写死与 `valid_ip6` 粗校验；新增 `--dry-run`。
 
-补齐 DNS 覆盖链、日志与可调参数。
+**v2.2.2** — 多上游兜底、DNS 全断自救、`dig` 失败文本误判、dhcpcd 钩子路径、非交互 EOF 死循环、`chattr` 假成功、`--restore` 三连问题、`restart_unbound` 假成功等 13 个 bug。
 
-- 新增：NetworkManager 覆盖链。写入 `/etc/NetworkManager/conf.d/99-dns-setup.conf`（`dns=none` + `rc-manager=unmanaged`）。NM 自行管理 resolv.conf 时，之前所有写入都会被它覆盖回去。
-- 新增：systemd-networkd 覆盖链。为每个 `*.network` 创建 `*.network.d/99-dns-setup.conf`（`UseDNS=no`），保留 DHCP 本身工作但阻止 DNS 下发。
-- 新增：openresolv / resolvconf 覆盖链。写入 `/etc/resolvconf.conf` 的 `name_servers="127.0.0.1"`。Debian/Alpine 上这是最常见却被忽略的覆盖源。
-- 新增：上述三条链的回滚。`restore_dhcp_guards` 现在会删除 NM drop-in、networkd drop-in，并用 awk 精确剥离 `resolvconf.conf` 中的标记段（只删自己写的，不碰原有 `search` 等配置）。
-- 新增：unbound 日志。配置 `logfile: "/var/log/unbound.log"` + `log-time-ascii: yes` + `use-syslog: no`。写入前自动创建文件、`chown unbound:unbound`、`chmod 640`；无法创建时自动降级为 `use-syslog: no` 并告警，不会因为日志权限导致 unbound 起不来。
-- 新增：`do-not-query-localhost: yes`，降低被当成开放解析器滥用的风险。
-- 新增：三个环境变量可覆盖参数：
-  - `CACHE_MIN_TTL`（默认 3600）——CDN 调度 / DDNS 场景应调小，如 `60`
-  - `SCAN_TIMEOUT`（默认 1 秒）——繁忙 VPS 上 1 秒容易把好节点判死
-  - `SCAN_COUNT`（默认 2 次）——2 次取平均噪声偏大，建议 5
-- 改进：`--dry-run` 在探测日志可写性时不再创建任何文件，只判断目录权限，保证打印内容与实际写入一致。
+**v2.2.1** — `--restore` 还原后若备份仍指向本地 unbound，保持 unbound 运行并继续托管，避免「还原完成后 DNS 解析失败」。
 
-### v2.3.0（2026-10-18）
+</details>
 
-本轮聚焦「失败原子性」：每个改动都必须能被安全撤销，绝不把系统留在看似正常、重启才炸的状态。
+---
 
-- 修复（高危）：`write_unbound_conf` 先写生产文件再 `unbound-checkconf` 校验，校验失败直接 return，坏配置已落盘。当下 unbound 还跑旧内存配置看不出问题，下次重启就再也起不来。改为写临时文件 → 校验 → `mv` 原子替换，校验失败原配置分毫不动。
-- 修复（高危）：`/etc/resolv.conf` 是符号链接时（Debian/Ubuntu 上 systemd-resolved 指向 `/run/systemd/resolve/stub-resolv.conf`），`>` 写入会穿透链接落到 tmpfs，重启全丢，`chattr` 也加在 tmpfs 上无效。新增 `unlink_resolv` 先记录原链接目标再替换为实体文件。
-- 修复（高危）：`protect_dhcp` 用 `cat >` 无条件 truncate `/etc/dhcpcd.enter-hook`。这是系统级共享钩子，其他软件（NetworkManager / 云厂商 agent / 自定义 hook）写在这里的内容会被静默清空。改为追加写入并加 BEGIN/END 标记，便于精确撤销。
-- 修复（高危）：验证失败只恢复 `/etc/resolv.conf`，但 `MANAGED_MARKER`、udhcpc 插桩、dhcpcd 钩子、systemd-resolved 停用状态全部保留。结果 DNS 恢复成 DHCP 下发的旧值，可这个旧值从此再也不会被 DHCP 更新——换机房、换子网、续租拿到新 DNS 全部失效且无任何报错。新增 `save_pre_state` / `rollback_changes` / `restore_dhcp_guards` 统一完整回滚。
-- 修复（高危）：`--restore` 还原成不依赖本地 unbound 的静态 DNS 后，没有清理托管标记与 DHCP 保护，同样造成 DHCP 被永久屏蔽。现在同步撤销。
-- 修复：`write_resolv` 最后一句是 `ok()`（恒为真），写入失败也返回 0，导致 `apply_dns` 里的回滚分支永远不会执行。改为失败返回非 0。
-- 修复：没有中断保护。`apply_dns` 中途被 Ctrl+C / SSH 断开 / timeout 杀掉时，可能停在「unbound.conf 已换新、resolv.conf 还是旧值」的半成品态。新增 `trap 'on_interrupt' INT TERM`。
-- 修复：`do-ip6: no` 写死，手动输入的 IPv6 上游能通过校验并写入 `forward-addr`，但 unbound 根本不会去连，必然 verify 失败回滚——README 宣称的 IPv6 支持实际不可用。现在按上游地址族动态生成。
-- 修复：`valid_ip6` 的 `^[0-9A-Fa-f:]+$` 会放行 `:::::`、`12345::` 这类非法地址，同时拒绝 `::ffff:127.0.0.1`。改为按 8 组 / `::` 压缩一次的严格校验，只用 busybox awk 支持的内置函数（busybox 无 `rindex()`）。
-- 新增：`--dry-run` 预演模式，只打印将写入的 `unbound.conf`、`resolv.conf` 与 DHCP 保护动作，不修改任何文件。
+## 🙏 致谢与许可
 
-### v2.2.2（2026-08-31）
+- DNS 节点与测速脚本来自 [akile-network/aktools](https://github.com/akile-network/aktools)（AKDNS）
+- 转发与缓存由 [NLnet Labs Unbound](https://nlnetlabs.nl/projects/unbound/about/) 提供
 
-- 修复（高危）：`unbound` 只配置单个上游，节点下线后整机 DNS 全断且 unbound 仍显示 started。现在写入最快节点 + 最多 3 个备用上游。
-- 修复（高危）：`--auto` 在本机 DNS 已断时无法下载 AKDNS 脚本（鸡生蛋死锁）。新增公共解析器取 IP + 直连兜底与 IP 缓存。
-- 修复（高危）：`wait_dns_ready` 用 `grep [0-9]` 判断解析成功，而 dig 失败时会把含数字的错误文本写到 stdout，导致误判成功、自动回滚永不触发。改为过滤 `^;` 注释行并严格匹配整行 IP。
-- 修复（高危）：dhcpcd 保护写入 `/etc/dhcpcd.enter-hooks.d`，该目录不被 `dhcpcd-run-hooks` 加载，保护静默失效。改用官方保证加载的 `/etc/dhcpcd.enter-hook` 设置 `skip_hooks`，并清理旧位置残留。
-- 修复：非交互（`curl | sh`）时菜单 `read` 遇 EOF 不报错，造成无限刷屏死循环。新增 `require_tty` 守卫与 EOF 退出。
-- 修复：容器缺少 `CAP_LINUX_IMMUTABLE` 时 `chattr +i` 返回 0 但未生效，脚本误报“已锁定”。现在用 `lsattr` 复核并如实警告。
-- 修复：`restore_dns` 用 `ls -t` 选备份，同秒创建的备份 mtime 相同会退化为目录序而还原到最旧备份；改为按文件名时间戳倒序。
-- 修复：`restore_dns` 分别取 resolv.conf 与 unbound.conf 的最新文件，跨时间点错配；改为按同一时间戳配对。
-- 修复：0 字节备份会被还原成空 `resolv.conf` 并触发停止 unbound，导致 DNS 彻底中断；现在跳过空备份，全空时拒绝还原。
-- 修复：`apply_dns` 验证失败时只调 `restore_dns`（会还原到上一次备份而非改动前状态），且未恢复 immutable 属性；现在先快照本次改动前的 resolv.conf 并完整回滚。
-- 修复：`restart_unbound` 不确认服务真的起来（OpenRC stale 态下 restart 返回 0 但进程未启动）。新增 `unbound_running` 校验与二次重启兜底。
-- 修复：`protect_dhcp` 改写 udhcpc 脚本时，文件末尾无换行会丢失最后一行（如 `exit 0`）。
-- 新增：root 权限检查；手动输入支持 IPv6；`--restore` 后实测解析并提示；确认提示在 EOF 下默认拒绝而非静默应用。
-- 修正：文件头注释版本号与 `VERSION` 不一致（2.2.0 / 2.2.1）。
+**许可**：MIT
 
-### v2.2.1（2026-08-30）
+> ⚠️ **免责声明**：本项目仅供技术学习与研究使用。脚本会修改系统 DNS 管理行为，建议操作前创建 VPS / 容器快照。请在你拥有或获授权管理的服务器上使用，并遵守所在地法律法规及服务商条款。
 
-- 修复：`--restore` 还原后若备份的 `resolv.conf` 仍指向本地 unbound（`127.0.0.1`），保持 unbound 运行并继续托管，避免出现“还原完成后 DNS 解析失败”的问题。
-- 修复：仅当还原内容不依赖本地 unbound 时，才停止 unbound 并移除开机自启。
-- README：菜单示例版本号与还原行为说明同步更新。
+<div align="center">
 
-## 📄 License
+**[⬆ 回到顶部](#-dns-setup)**
 
-MIT
+Made with 🛡 by [zhangweixy666](https://github.com/zhangweixy666)
 
-## 🔗 相关链接
-
-- AKDNS 官方项目：https://github.com/akile-network/aktools
-- AKDNS 官方脚本：https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh
-- 本项目：https://github.com/zhangweixy666/dns-setup
+</div>
